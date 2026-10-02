@@ -15,6 +15,9 @@ use core::any::Any;
 use core::fmt;
 use std::sync::Arc;
 
+// Фиксирует версию picky-krb, совместимую с текущим API sspi.
+use picky_krb as _;
+
 use ironrdp_core::{Encode, WriteBuf, encode_buf, encode_vec};
 use ironrdp_pdu::nego::NegoRequestData;
 use ironrdp_pdu::rdp::capability_sets::{self, BitmapCodecs};

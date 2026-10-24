@@ -27,6 +27,7 @@ ironrdp-core = { path = "../ironrdp-core", version = "0.3" } # public
 ironrdp-error = { path = "../ironrdp-error", version = "0.2" } # public
 ironrdp-pdu = { path = "../ironrdp-pdu", version = "0.10", features = ["std"] } # public
 sspi = { version = "0.23", features = ["scard"] } # public
+picky-krb = "=0.12.4"
 url = "2.5" # public
 rand = { version = "0.9", features = ["std"] } # TODO: dependency injection?
 tracing = { version = "0.1", features = ["log"] }

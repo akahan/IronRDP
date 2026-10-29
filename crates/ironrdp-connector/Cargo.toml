@@ -31,7 +31,7 @@ ironrdp-pdu = { path = "../ironrdp-pdu", version = "0.11", features = ["std"] } 
 sspi = { version = "0.23.1", features = ["scard"] } # public
 ironrdp-dvc = { path = "../ironrdp-dvc", version = "0.10", optional = true } # public
 ironrdp-rdpear = { path = "../ironrdp-rdpear", version = "0.1", optional = true }
-picky-krb = "=0.12.4"
+picky-krb = "0.13"
 url = "2.5" # public
 rand = { version = "0.9", features = ["std"] } # TODO: dependency injection?
 tracing = { version = "0.1", features = ["log"] }

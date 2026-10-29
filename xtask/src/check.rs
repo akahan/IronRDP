@@ -269,7 +269,37 @@ pub fn tests_compile(sh: &Shell) -> anyhow::Result<()> {
     .run()?;
     cmd!(
         sh,
+        "{CARGO} test -p ironrdp-mstsgu --test tcp_options --features native-tls,test-support --locked --no-run"
+    )
+    .run()?;
+    cmd!(
+        sh,
+        "{CARGO} test -p ironrdp-mstsgu --test tcp_options --features rustls,test-support --locked --no-run"
+    )
+    .run()?;
+    cmd!(
+        sh,
         "{CARGO} test -p ironrdp-mstsgu --test http_auth --features native-tls,smartcard --locked --no-run"
+    )
+    .run()?;
+    cmd!(
+        sh,
+        "{CARGO} test -p ironrdp-rdpeudp-tokio --features ice --locked --no-run"
+    )
+    .run()?;
+    cmd!(
+        sh,
+        "{CARGO} test -p ironrdp-rdpeudp-tokio --features ice,rustls-ring --locked --no-run"
+    )
+    .run()?;
+    cmd!(
+        sh,
+        "{CARGO} test -p ironrdp-testsuite-core --features remote-guard --locked --no-run"
+    )
+    .run()?;
+    cmd!(
+        sh,
+        "{CARGO} test -p ironrdp-testsuite-extra --features remote-guard --locked --no-run"
     )
     .run()?;
     println!("All good!");
@@ -291,7 +321,33 @@ pub fn tests_run(sh: &Shell) -> anyhow::Result<()> {
     .run()?;
     cmd!(
         sh,
+        "{CARGO} test -p ironrdp-mstsgu --test tcp_options --features native-tls,test-support --locked"
+    )
+    .run()?;
+    cmd!(
+        sh,
+        "{CARGO} test -p ironrdp-mstsgu --test tcp_options --features rustls,test-support --locked"
+    )
+    .run()?;
+    cmd!(
+        sh,
         "{CARGO} test -p ironrdp-mstsgu --test http_auth --features native-tls,smartcard --locked"
+    )
+    .run()?;
+    cmd!(sh, "{CARGO} test -p ironrdp-rdpeudp-tokio --features ice --locked").run()?;
+    cmd!(
+        sh,
+        "{CARGO} test -p ironrdp-rdpeudp-tokio --features ice,rustls-ring --locked"
+    )
+    .run()?;
+    cmd!(
+        sh,
+        "{CARGO} test -p ironrdp-testsuite-core --features remote-guard --locked -- connector::remote_guard"
+    )
+    .run()?;
+    cmd!(
+        sh,
+        "{CARGO} test -p ironrdp-testsuite-extra --features remote-guard --locked -- client::remote_guard"
     )
     .run()?;
     println!("All good!");

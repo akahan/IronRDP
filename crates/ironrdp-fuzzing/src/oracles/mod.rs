@@ -178,7 +178,26 @@ pub fn pdu_decode(data: &[u8]) {
     let _ = decode::<gcc::ConferenceCreateRequest>(data);
     let _ = decode::<gcc::ConferenceCreateResponse>(data);
 
-    let _ = decode::<server_license::LicensePdu>(data);
+    // The client answers a license request with either reply, both encrypting with the public key from the server's
+    // certificate.
+    if let Ok(server_license::LicensePdu::ServerLicenseRequest(license_request)) =
+        decode::<server_license::LicensePdu>(data)
+    {
+        let _ = server_license::ClientNewLicenseRequest::from_server_license_request(
+            &license_request,
+            &[0; 32],
+            &[0; 48],
+            "user",
+            "machine",
+        );
+        let _ = server_license::ClientLicenseInfo::from_server_license_request(
+            &license_request,
+            &[0; 32],
+            &[0; 48],
+            [0; 4],
+            Vec::new(),
+        );
+    }
 
     // Post-licensing multitransport bootstrapping: the connector try-decodes
     // arbitrary server bytes as a request to distinguish it from Demand Active.
@@ -226,6 +245,16 @@ pub fn pdu_decode(data: &[u8]) {
 
     let _ = decode::<ironrdp_displaycontrol::pdu::DisplayControlPdu>(data);
     let _ = decode::<ironrdp_rdpel::pdu::LocationPdu>(data);
+    let _ = decode::<ironrdp_w365::vdcswitch::pdu::VdcSwitchPdu>(data);
+    let _ = decode::<ironrdp_w365::battery::BatteryPdu>(data);
+    let _ = decode::<ironrdp_w365::power_request::PowerRequestPdu>(data);
+    let _ = decode::<ironrdp_w365::screen_capture::ScreenCapturePdu>(data);
+    let _ = decode::<ironrdp_rdpear::AuthRedirectionPdu>(data);
+    let _ = decode::<ironrdp_rdpear::RemoteGuardInnerPacket<'_>>(data);
+    let _ = decode::<ironrdp_rdpear::ndr::KerberosRequest>(data);
+    let _ = decode::<ironrdp_rdpear::ndr::KerberosResponse>(data);
+    let _ = decode::<ironrdp_rdpear::ndr::NtlmRequest>(data);
+    let _ = decode::<ironrdp_rdpear::ndr::NtlmResponse>(data);
 
     let _ = decode::<ironrdp_rdpsnd::pdu::ServerAudioOutputPdu<'_>>(data);
     let _ = decode::<ironrdp_rdpsnd::pdu::ClientAudioOutputPdu>(data);
@@ -399,10 +428,57 @@ pub fn pdu_round_trip(data: &[u8]) {
 
     // Location
     pdu_round_trip_one!(data, ironrdp_rdpel::pdu::LocationPdu);
+    pdu_round_trip_one!(data, ironrdp_rdpear::AuthRedirectionPdu);
+    pdu_round_trip_one!(data, ironrdp_rdpear::RemoteGuardInnerPacket<'_>);
+    rdpear_ndr_round_trip(data);
+
+    // Virtual desktop control
+    pdu_round_trip_one!(data, ironrdp_w365::vdcswitch::pdu::VdcSwitchPdu);
+
+    // Windows 365 device redirection
+    pdu_round_trip_one!(data, ironrdp_w365::battery::BatteryPdu);
+    pdu_round_trip_one!(data, ironrdp_w365::power_request::PowerRequestPdu);
+    pdu_round_trip_one!(data, ironrdp_w365::screen_capture::ScreenCapturePdu);
 
     // RDPSND
     pdu_round_trip_one!(data, ironrdp_rdpsnd::pdu::ServerAudioOutputPdu<'_>);
     pdu_round_trip_one!(data, ironrdp_rdpsnd::pdu::ClientAudioOutputPdu);
+}
+
+/// Bounded package-codec oracle; successful decodes must encode and preserve typed data in both byte orders.
+pub fn rdpear_ndr_round_trip(data: &[u8]) {
+    use ironrdp_rdpear::ndr::{
+        Endianness, KerberosRequest, KerberosResponse, NdrLimits, NdrProfile, NtlmRequest, NtlmResponse,
+    };
+
+    let limits = NdrLimits {
+        max_message_size: 65536,
+        max_allocation: 262144,
+        max_elements: 16384,
+    };
+    macro_rules! check {
+        ($ty:ty) => {
+            for profile in [NdrProfile::Published, NdrProfile::WindowsNative] {
+                if let Ok(value) = <$ty>::decode_with_profile(data, limits, profile) {
+                    for endian in [Endianness::Little, Endianness::Big] {
+                        let bytes = value
+                            .encode_with_profile(endian, limits, profile)
+                            .expect("decoded NDR value must encode");
+                        let decoded =
+                            <$ty>::decode_with_profile(&bytes, limits, profile).expect("encoded NDR value must decode");
+                        assert_eq!(
+                            value, decoded,
+                            "NDR round-trip must preserve typed protocol values"
+                        );
+                    }
+                }
+            }
+        };
+    }
+    check!(KerberosRequest);
+    check!(KerberosResponse);
+    check!(NtlmRequest);
+    check!(NtlmResponse);
 }
 
 /// Round-trip oracle for `ironrdp-egfx` PDU types: `decode` → `encode_vec` → re-`decode`.
@@ -644,6 +720,65 @@ pub fn channel_process(input: &[u8]) {
         ));
 
     let _ = rdpdr.process(input);
+    dvc_server_process(input);
+}
+
+fn dvc_server_process(input: &[u8]) {
+    use ironrdp_core::{encode_vec, impl_as_any};
+    use ironrdp_dvc::pdu::{CapabilitiesResponsePdu, CapsVersion, CreateResponsePdu, CreationStatus, DrdynvcClientPdu};
+    use ironrdp_dvc::{DrdynvcServer, DvcMessage, DvcProcessor, DvcServerProcessor};
+    use ironrdp_pdu::PduResult;
+    use ironrdp_svc::SvcProcessor as _;
+
+    let mut server = DrdynvcServer::new().with_dynamic_channel(NoopServerDvc);
+    let _ = server.start();
+    if let Ok(caps) = encode_vec(&DrdynvcClientPdu::Capabilities(CapabilitiesResponsePdu::new(
+        CapsVersion::V3,
+    ))) {
+        let _ = server.process(&caps);
+    }
+    if let Ok(open) = encode_vec(&DrdynvcClientPdu::Create(CreateResponsePdu::new(0, CreationStatus::OK))) {
+        let _ = server.process(&open);
+    }
+    if server.create_channel(NoopServerDvc).is_ok() {
+        let _ = server.close_channel(1);
+    }
+    if server.create_channel(NoopServerDvc).is_ok()
+        && let Ok(decline) = encode_vec(&DrdynvcClientPdu::Create(CreateResponsePdu::new(
+            2,
+            CreationStatus::NO_LISTENER,
+        )))
+    {
+        let _ = server.process(&decline);
+        let _ = server.close_channel(2);
+    }
+    let _ = server.create_channel(NoopServerDvc);
+    let _ = server.process(input);
+    return;
+
+    struct NoopServerDvc;
+
+    impl_as_any!(NoopServerDvc);
+
+    impl DvcProcessor for NoopServerDvc {
+        fn channel_name(&self) -> &str {
+            "fuzz"
+        }
+
+        fn max_message_size(&self) -> Option<usize> {
+            Some(4096)
+        }
+
+        fn start(&mut self, _channel_id: u32) -> PduResult<Vec<DvcMessage>> {
+            Ok(Vec::new())
+        }
+
+        fn process(&mut self, _channel_id: u32, _payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl DvcServerProcessor for NoopServerDvc {}
 }
 
 pub fn cliprdr_channel_process(input: &[u8]) {

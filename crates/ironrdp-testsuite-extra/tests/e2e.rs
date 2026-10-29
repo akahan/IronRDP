@@ -1,7 +1,10 @@
 // FIXME: tests in this module can probably be rewritten to be much shorter using the ironrdp-client crate.
 
 use core::net::SocketAddr;
+use core::num::{NonZeroU16, NonZeroU32, NonZeroUsize};
+use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::task::{Context, Poll};
 use core::time::Duration;
 use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -13,13 +16,16 @@ use ironrdp::dvc::DrdynvcClient;
 use ironrdp::echo::client::EchoClient;
 use ironrdp::pdu::bitmap::{BitmapData, BitmapUpdateData, Compression};
 use ironrdp::pdu::fast_path::{EncryptionFlags, FastPathHeader, FastPathUpdatePdu, Fragmentation, UpdateCode};
-use ironrdp::pdu::geometry::InclusiveRectangle;
-use ironrdp::pdu::rdp::capability_sets::MajorPlatformType;
+use ironrdp::pdu::geometry::{InclusiveRectangle, Rectangle as _};
+use ironrdp::pdu::rdp::capability_sets::{InputFlags, MajorPlatformType};
 use ironrdp::pdu::rdp::client_info::CompressionType as PduCompressionType;
 use ironrdp::pdu::rdp::headers::CompressionFlags;
 use ironrdp::pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode};
 use ironrdp::pdu::rdp::session_info::ServerAutoReconnect;
 use ironrdp::pdu::{self, gcc};
+use ironrdp::rdpsnd::client::{NoopRdpsndBackend, Rdpsnd};
+use ironrdp::rdpsnd::pdu::AudioFormat;
+use ironrdp::rdpsnd::server::{NegotiatedFormat, RdpsndError, RdpsndServer, RdpsndServerHandler};
 use ironrdp::server::{
     self, Acceptor, DesktopSize, DisplayContext, DisplayUpdate, KeyboardEvent, MouseEvent, PixelFormat, RdpServer,
     RdpServerDisplay, RdpServerDisplayUpdates, RdpServerInputHandler, ServerEvent, ServerResult, StaticChannelFactory,
@@ -30,6 +36,7 @@ use ironrdp::session::{self, ActiveStage, ActiveStageBuilder, ActiveStageOutput}
 use ironrdp::svc::{StaticChannelSet, SvcMessage, SvcProcessor, SvcServerProcessor};
 use ironrdp_async::{Framed, FramedWrite as _};
 use ironrdp_bulk::{BulkCompressor, CompressionType as BulkCompressionType, flags as bulk_flags};
+use ironrdp_core::{ReadCursor, decode_cursor};
 use ironrdp_dvc::{DvcClientProcessor, DvcEncode, DvcMessage, DvcProcessor};
 use ironrdp_egfx::pdu::{CapabilitiesAdvertisePdu, CapabilitiesV8Flags, CapabilitySet, GfxPdu};
 use ironrdp_rdpdr::pdu::RdpdrPdu;
@@ -40,10 +47,11 @@ use ironrdp_rdpdr::pdu::efs::{
 };
 use ironrdp_rdpdr::pdu::esc::{ScardCall, ScardIoCtlCode};
 use ironrdp_rdpdr::{Rdpdr, RdpdrBackend, RdpdrBackendFactory, RdpdrBackendProduct, RdpdrDrive};
-use ironrdp_server::{GfxServerFactory, ServerEventSender};
+use ironrdp_server::{GfxContext, GfxServerFactory, MAX_FASTPATH_UPDATE_SIZE, ServerEventSender};
 use ironrdp_testsuite_extra as _;
 use ironrdp_tls::TlsStream;
 use ironrdp_tokio::TokioStream;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Mutex, oneshot};
@@ -99,6 +107,247 @@ async fn test_client_server_advertising_dyn_vc_gfx_protocol() {
         |stage, _activation_factory, framed, _display_tx| async { (stage, framed) },
     )
     .await
+}
+
+/// The server sizes fast-path updates by the client's Multifragment Update Capability Set.
+///
+/// [MS-RDPBCGR] 2.2.7.2.6: MaxRequestSize is the size of the client's reassembly buffer, so no
+/// fragmented update may be larger. The IronRDP client echoes the size the server advertises,
+/// so the test lowers it in the client's Confirm Active PDU on its way to the server, which
+/// keeps advertising its default of 8 MB.
+///
+/// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/01717954-716a-424d-af35-28fb2b86df89
+// oracle: spec MS-RDPBCGR §2.2.7.2.6 (MaxRequestSize is the size of the client's reassembly buffer)
+#[tokio::test]
+async fn fast_path_updates_fit_the_client_max_request_size() {
+    let largest = largest_fast_path_update(65_536).await;
+    assert!(
+        largest <= 65_536,
+        "a {largest}-byte update exceeds the client's 65,536-byte MaxRequestSize"
+    );
+}
+
+/// A client buffer smaller than one fast-path fragment gets updates of one fragment each.
+///
+/// [MS-RDPBCGR] 2.2.9.1.2.1: an update sent as a single fragment is never reassembled, so the
+/// client's buffer does not bound it.
+///
+/// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/a1c4caa8-00ed-45bb-a06e-5177473766d3
+// oracle: spec MS-RDPBCGR §2.2.9.1.2.1 (an update sent as a single FASTPATH_FRAGMENT_SINGLE is never reassembled)
+#[tokio::test]
+async fn a_client_max_request_size_below_one_fragment_gets_single_fragments() {
+    let largest = largest_fast_path_update(4_096).await;
+    assert!(
+        4_096 < largest && largest <= MAX_FASTPATH_UPDATE_SIZE,
+        "the largest update has {largest} bytes, not up to one {MAX_FASTPATH_UPDATE_SIZE}-byte fragment"
+    );
+}
+
+/// Connects a client that advertises `client_max_request_size`, sends it one full frame, and
+/// returns the size of the largest fast-path update the client reassembles.
+async fn largest_fast_path_update(client_max_request_size: u32) -> usize {
+    // The server's default, which it advertises in its Demand Active PDU.
+    const SERVER_MAX_REQUEST_SIZE: u32 = 8 * 1024 * 1024;
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
+    let cert_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-cert.pem");
+    let key_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-key.pem");
+    let identity = TlsIdentityCtx::init_from_paths(&cert_path, &key_path).expect("failed to init TLS identity");
+    let acceptor = identity.make_acceptor().expect("failed to build TLS acceptor");
+
+    let (display_tx, display_rx) = mpsc::unbounded_channel();
+    let mut server = RdpServer::builder()
+        .with_addr(([127, 0, 0, 1], 0))
+        .with_tls(acceptor)
+        .with_input_handler(TestInputHandler)
+        .with_display_handler(TestDisplay {
+            rx: Arc::new(Mutex::new(display_rx)),
+            offers_display_control: false,
+        })
+        .build();
+    server.set_credentials(Some(server::Credentials {
+        username: USERNAME.into(),
+        password: PASSWORD.into(),
+        domain: None,
+    }));
+    let ev = server.event_sender().clone();
+    let rewritten = Arc::new(AtomicBool::new(false));
+    let client_rewritten = Arc::clone(&rewritten);
+
+    let local = tokio::task::LocalSet::new();
+    let largest = local
+        .run_until(async move {
+            let server = tokio::task::spawn_local(async move { server.run().await.unwrap() });
+
+            let client = tokio::task::spawn_local({
+                let rewritten = client_rewritten;
+                async move {
+                    let server_addr = local_addr_of(&ev).await;
+                    let (mut framed, connection_result) = connect_client_with(
+                        server_addr,
+                        |client_addr| connector::ClientConnector::new(default_client_config(), client_addr),
+                        |stream| MaxRequestSizeRewrite {
+                            inner: stream,
+                            from: multifragment_update_capability(SERVER_MAX_REQUEST_SIZE),
+                            to: multifragment_update_capability(client_max_request_size),
+                            rewritten,
+                        },
+                    )
+                    .await;
+                    let mut stage = ActiveStageBuilder {
+                        static_channels: connection_result.static_channels,
+                        user_channel_id: connection_result.user_channel_id,
+                        io_channel_id: connection_result.io_channel_id,
+                        message_channel_id: connection_result.message_channel_id,
+                        share_id: connection_result.share_id,
+                        compression_type: connection_result.compression_type,
+                        enable_server_pointer: connection_result.enable_server_pointer,
+                        pointer_software_rendering: connection_result.pointer_software_rendering,
+                    }
+                    .build();
+
+                    display_tx
+                        .send(DisplayUpdate::Bitmap(incompressible_frame(
+                            DESKTOP_WIDTH,
+                            DESKTOP_HEIGHT,
+                        )))
+                        .unwrap();
+
+                    let mut image = DecodedImage::new(PixelFormat::RgbA32, DESKTOP_WIDTH, DESKTOP_HEIGHT);
+                    let mut painted = 0;
+                    let mut reassembled = 0;
+                    let mut largest = 0;
+                    while painted < usize::from(DESKTOP_WIDTH) * usize::from(DESKTOP_HEIGHT) {
+                        let (action, payload) = tokio::time::timeout(Duration::from_secs(10), framed.read_pdu())
+                            .await
+                            .expect("the whole frame arrives")
+                            .expect("valid PDU");
+                        if action == pdu::Action::FastPath {
+                            let mut cursor = ReadCursor::new(&payload);
+                            let _: FastPathHeader = decode_cursor(&mut cursor).expect("fast-path header");
+                            let update: FastPathUpdatePdu<'_> = decode_cursor(&mut cursor).expect("fast-path update");
+                            reassembled = match update.fragmentation {
+                                Fragmentation::Single | Fragmentation::First => update.data.len(),
+                                Fragmentation::Next | Fragmentation::Last => reassembled + update.data.len(),
+                            };
+                            largest = largest.max(reassembled);
+                        }
+                        for output in stage
+                            .process(&mut image, action, &payload, None)
+                            .expect("stage process")
+                        {
+                            match output {
+                                ActiveStageOutput::GraphicsUpdate(rect) => {
+                                    painted += usize::from(rect.width()) * usize::from(rect.height())
+                                }
+                                ActiveStageOutput::ResponseFrame(frame) => {
+                                    framed.write_all(&frame).await.expect("write frame")
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+
+                    for output in stage.graceful_shutdown().expect("shutdown") {
+                        if let ActiveStageOutput::ResponseFrame(frame) = output {
+                            framed.write_all(&frame).await.expect("write frame");
+                        }
+                    }
+                    while framed.read_pdu().await.is_ok() {}
+                    let _ = ev.send(ServerEvent::Quit("bye".into()));
+                    largest
+                }
+            });
+
+            let ((), largest) = tokio::try_join!(server, client).expect("join");
+            largest
+        })
+        .await;
+
+    assert!(
+        rewritten.load(Ordering::Relaxed),
+        "the client's Multifragment Update Capability Set was not rewritten"
+    );
+    largest
+}
+
+/// A Multifragment Update Capability Set ([MS-RDPBCGR] 2.2.7.2.6) as it is encoded.
+///
+/// [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/01717954-716a-424d-af35-28fb2b86df89
+fn multifragment_update_capability(max_request_size: u32) -> [u8; 8] {
+    let mut capability = [0x1a, 0x00, 0x08, 0x00, 0, 0, 0, 0];
+    capability[4..].copy_from_slice(&max_request_size.to_le_bytes());
+    capability
+}
+
+/// Replaces the client's first Multifragment Update Capability Set before TLS encrypts it.
+struct MaxRequestSizeRewrite<S> {
+    inner: S,
+    from: [u8; 8],
+    to: [u8; 8],
+    rewritten: Arc<AtomicBool>,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for MaxRequestSizeRewrite<S> {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for MaxRequestSizeRewrite<S> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let at = (!this.rewritten.load(Ordering::Relaxed))
+            .then(|| buf.windows(this.from.len()).position(|window| window == this.from))
+            .flatten();
+        let Some(at) = at else {
+            return Pin::new(&mut this.inner).poll_write(cx, buf);
+        };
+        let mut patched = buf.to_vec();
+        patched[at..at + this.to.len()].copy_from_slice(&this.to);
+        let written = Pin::new(&mut this.inner).poll_write(cx, &patched);
+        if let Poll::Ready(Ok(written)) = written
+            && at + this.to.len() <= written
+        {
+            this.rewritten.store(true, Ordering::Relaxed);
+        }
+        written
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// A frame of pixels with no runs or repeats for an encoder to exploit.
+fn incompressible_frame(width: u16, height: u16) -> server::BitmapUpdate {
+    let len = usize::from(width) * usize::from(height) * 4;
+    // xorshift64
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let data: Vec<u8> = core::iter::repeat_with(|| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state.to_le_bytes()[0]
+    })
+    .take(len)
+    .collect();
+    server::BitmapUpdate {
+        x: 0,
+        y: 0,
+        width: NonZeroU16::new(width).unwrap(),
+        height: NonZeroU16::new(height).unwrap(),
+        format: PixelFormat::BgrA32,
+        data: data.into(),
+        stride: NonZeroUsize::new(usize::from(width) * 4).unwrap(),
+    }
 }
 
 #[tokio::test]
@@ -267,6 +516,27 @@ fn compressed_bitmap_fastpath_frame(compressor: &mut BulkCompressor) -> (Vec<u8>
     (frame, flags)
 }
 
+/// Reads one PDU from the server, waiting at most 150 ms, processes it and writes back whatever the client answers.
+/// Returns whether a PDU arrived.
+async fn serve_one_pdu(
+    stage: &mut ActiveStage,
+    framed: &mut Framed<TokioStream<TlsStream<TcpStream>>>,
+    image: &mut DecodedImage,
+) -> bool {
+    let read_result = tokio::time::timeout(Duration::from_millis(150), framed.read_pdu()).await;
+    let Ok(Ok((action, frame))) = read_result else {
+        return false;
+    };
+
+    let outputs = stage.process(image, action, &frame, None).expect("stage process");
+    for output in outputs {
+        if let ActiveStageOutput::ResponseFrame(frame) = output {
+            framed.write_all(&frame).await.expect("write response frame");
+        }
+    }
+    true
+}
+
 /// Sends echo requests and serves the client session until the server reports
 /// the round trip for `payload`, or five seconds pass.
 async fn drive_echo_round_trip(
@@ -290,17 +560,7 @@ async fn drive_echo_round_trip(
                 return Some(measurement);
             }
 
-            let read_result = tokio::time::timeout(Duration::from_millis(150), framed.read_pdu()).await;
-            let Ok(Ok((action, frame))) = read_result else {
-                continue;
-            };
-
-            let outputs = stage.process(&mut image, action, &frame, None).expect("stage process");
-            for output in outputs {
-                if let ActiveStageOutput::ResponseFrame(frame) = output {
-                    framed.write_all(&frame).await.expect("write response frame");
-                }
-            }
+            serve_one_pdu(stage, framed, &mut image).await;
         }
     }
 
@@ -435,18 +695,8 @@ async fn run_display_control_probe(offers_display_control: bool) -> (bool, bool)
             let deadline = Instant::now() + Duration::from_secs(5);
             let mut settled = false;
             while !settled && Instant::now() < deadline {
-                let read_result = tokio::time::timeout(Duration::from_millis(150), framed.read_pdu()).await;
-                let Ok(Ok((action, frame))) = read_result else {
-                    settled = observed_echo.load(Ordering::Relaxed);
-                    continue;
-                };
-
-                let outputs = stage.process(&mut image, action, &frame, None).expect("stage process");
-                for output in outputs {
-                    if let ActiveStageOutput::ResponseFrame(frame) = output {
-                        framed.write_all(&frame).await.expect("write response frame");
-                    }
-                }
+                settled =
+                    !serve_one_pdu(&mut stage, &mut framed, &mut image).await && observed_echo.load(Ordering::Relaxed);
             }
 
             (stage, framed)
@@ -458,6 +708,105 @@ async fn run_display_control_probe(offers_display_control: bool) -> (bool, bool)
         echo_started.load(Ordering::Relaxed),
         display_control_started.load(Ordering::Relaxed),
     )
+}
+
+/// A client that sets neither INFO_NOAUDIOPLAYBACK nor INFO_REMOTECONSOLEAUDIO gets its audio redirected, per
+/// MS-RDPBCGR [2.2.1.11.1.1] Info Packet (TS_INFO_PACKET): "If the INFO_NOAUDIOPLAYBACK flag is not set, then audio
+/// redirection SHOULD take place if the INFO_REMOTECONSOLEAUDIO (0x00002000) flag is also not set."
+/// So the server starts rdpsnd.
+/// This fails if the no-audio check ever holds rdpsnd back from every client, and it shows the probe sees a start at
+/// all, which the test below relies on to mean anything.
+///
+/// [2.2.1.11.1.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/732394f5-e2b5-4ac5-8a0a-35345386b0d1
+// oracle: spec MS-RDPBCGR §2.2.1.11.1.1
+#[tokio::test]
+async fn rdpsnd_starts_for_a_client_that_wants_audio() {
+    assert!(run_rdpsnd_probe(true).await, "the server never started rdpsnd");
+}
+
+/// A client that sets INFO_NOAUDIOPLAYBACK still joins the rdpsnd channel here, and the server leaves it unstarted,
+/// since audio redirection MUST NOT take place then, per MS-RDPBCGR [2.2.1.11.1.1] Info Packet (TS_INFO_PACKET).
+///
+/// [2.2.1.11.1.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/732394f5-e2b5-4ac5-8a0a-35345386b0d1
+// oracle: spec MS-RDPBCGR §2.2.1.11.1.1
+#[tokio::test]
+async fn rdpsnd_is_not_started_for_a_client_that_asked_for_no_audio() {
+    assert!(
+        !run_rdpsnd_probe(false).await,
+        "the server started rdpsnd for a client that asked for no audio"
+    );
+}
+
+/// Connects a client that joins the rdpsnd channel, with `enable_audio_playback` as given, and returns whether the
+/// server started the channel, which is when it asks its sound handler for the formats to offer.
+///
+/// The client's echo channel opening is the sign that the connection has settled: the server starts its static
+/// channels, rdpsnd among them, before any dynamic channel exists.
+async fn run_rdpsnd_probe(enable_audio_playback: bool) -> bool {
+    let rdpsnd_started = Arc::new(AtomicBool::new(false));
+    let echo_started = Arc::new(AtomicBool::new(false));
+    let connector_echo = Arc::clone(&echo_started);
+
+    let mut client_config = default_client_config();
+    client_config.enable_audio_playback = enable_audio_playback;
+
+    client_server_with_connector(
+        client_config,
+        vec![Box::new(RdpsndProbeFactory(Arc::clone(&rdpsnd_started)))],
+        None,
+        move |connector| {
+            connector
+                .with_static_channel(Rdpsnd::new(Box::new(NoopRdpsndBackend)))
+                .with_static_channel(
+                    DrdynvcClient::new()
+                        .with_dynamic_channel(StartRecorder::new(ironrdp::echo::CHANNEL_NAME, connector_echo)),
+                )
+        },
+        move |mut stage, _activation_factory, mut framed, display_tx, _echo_handle| async move {
+            let _display_tx = display_tx;
+            let mut image = DecodedImage::new(PixelFormat::RgbA32, DESKTOP_WIDTH, DESKTOP_HEIGHT);
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !echo_started.load(Ordering::Relaxed) && Instant::now() < deadline {
+                serve_one_pdu(&mut stage, &mut framed, &mut image).await;
+            }
+            assert!(echo_started.load(Ordering::Relaxed), "the connection never settled");
+
+            (stage, framed)
+        },
+    )
+    .await;
+
+    rdpsnd_started.load(Ordering::Relaxed)
+}
+
+struct RdpsndProbeFactory(Arc<AtomicBool>);
+
+impl StaticChannelFactory for RdpsndProbeFactory {
+    fn attach(&self, acceptor: &mut Acceptor) {
+        acceptor.attach_static_channel(RdpsndServer::new(Box::new(RdpsndProbe(Arc::clone(&self.0)))));
+    }
+}
+
+/// Records whether the rdpsnd server asked for its formats, which it does only when the channel starts.
+#[derive(Debug)]
+struct RdpsndProbe(Arc<AtomicBool>);
+
+impl RdpsndServerHandler for RdpsndProbe {
+    fn get_formats(&self) -> &[AudioFormat] {
+        self.0.store(true, Ordering::Relaxed);
+        &[]
+    }
+
+    fn choose_format<'a>(&mut self, _common: &'a [NegotiatedFormat]) -> Option<&'a NegotiatedFormat> {
+        None
+    }
+
+    fn start(&mut self, _format: &NegotiatedFormat) -> Result<(), Box<dyn RdpsndError>> {
+        Ok(())
+    }
+
+    fn stop(&mut self) {}
 }
 
 #[tokio::test]
@@ -652,6 +1001,10 @@ async fn each_connection_gets_its_own_display_context() {
                 let (mut stage, activation_factory, mut framed) =
                     connect_active_client(server_addr, default_client_config(), None).await;
                 let first = ctx_rx.recv().await.expect("first connection's display context");
+                // The pointer caches from the client's Pointer Capability Set: the IronRDP client
+                // sends 32 entries for both.
+                assert_eq!(first.pointer_cache_size, 32);
+                assert_eq!(first.color_pointer_cache_size, 32);
 
                 // The client answers an RTT probe on its own, and the server
                 // records the result on the handles it gave the display.
@@ -1756,6 +2109,193 @@ async fn egfx_moves_onto_the_udp_tunnel_with_soft_sync() {
         .await;
 }
 
+/// The client's core Frame Acknowledge capability (MS-RDPRFX 2.2.1.3) is defined
+/// for surface-command frames; by default it does not cap the EGFX window, at
+/// activation or after a reactivation.
+// oracle: spec MS-RDPRFX §2.2.1.3 (TS_FRAME_ACKNOWLEDGE_CAPABILITYSET is for TS_FRAME_ACKNOWLEDGE_PDU)
+// oracle: spec MS-RDPEGFX §2.2.2.13 (EGFX frames are acknowledged with RDPGFX_FRAME_ACKNOWLEDGE_PDU)
+// oracle: regression #2237
+#[tokio::test]
+async fn core_frame_ack_capability_does_not_cap_the_egfx_window_by_default() {
+    assert_eq!(Box::pin(egfx_windows(None)).await, (30, 30));
+}
+
+// oracle: reference crates/ironrdp-connector/src/connection_activation.rs (max_unacknowledged_frame_count 20, FIXME(#447))
+// oracle: mutant the option to apply the core Frame Acknowledge capability to EGFX has no effect, or is not applied again after a reactivation
+#[tokio::test]
+async fn core_frame_ack_capability_caps_the_egfx_window_when_enabled() {
+    // The IronRDP client advertises maxUnacknowledgedFrameCount 20 with a bitmap
+    // codec: `ironrdp-connector` `connection_activation.rs`, a temporary value
+    // under FIXME(#447). Update this test when that value changes.
+    assert_eq!(Box::pin(egfx_windows(Some(true))).await, (20, 20));
+}
+
+/// Connects a client that advertises EGFX and a bitmap codec to a server whose
+/// EGFX window is 30, and returns the window once the EGFX channel is created,
+/// then again after a Deactivation-Reactivation Sequence (a display resize).
+/// Before the reactivation the window is set to a stale value, so the second
+/// result shows what the reactivation applied. `core_frame_ack_limit` is passed
+/// to the builder when given; `None` keeps the library default.
+async fn egfx_windows(core_frame_ack_limit: Option<bool>) -> (u32, u32) {
+    let cert_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-cert.pem");
+    let key_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs/server-key.pem");
+    let identity = TlsIdentityCtx::init_from_paths(&cert_path, &key_path).expect("failed to init TLS identity");
+    let acceptor = identity.make_acceptor().expect("failed to build TLS acceptor");
+
+    let handles = Arc::new(StdMutex::new(Vec::new()));
+    let (display_tx, display_rx) = mpsc::unbounded_channel();
+    let builder = RdpServer::builder()
+        .with_addr(([127, 0, 0, 1], 0))
+        .with_tls(acceptor)
+        .with_input_handler(TestInputHandler)
+        .with_display_handler(TestDisplay {
+            rx: Arc::new(Mutex::new(display_rx)),
+            offers_display_control: true,
+        })
+        .with_gfx_factory(Some(Box::new(WindowGfxFactory {
+            handles: Arc::clone(&handles),
+        })));
+    let mut server = match core_frame_ack_limit {
+        Some(enabled) => builder.with_egfx_core_frame_ack_limit(enabled),
+        None => builder,
+    }
+    .build();
+    server.set_credentials(Some(server::Credentials {
+        username: USERNAME.into(),
+        password: PASSWORD.into(),
+        domain: None,
+    }));
+    let ev = server.event_sender().clone();
+
+    let client_config = connector::Config {
+        support_dyn_vc_gfx_protocol: true,
+        bitmap: Some(connector::BitmapConfig {
+            lossy_compression: true,
+            color_depth: 32,
+            codecs: pdu::rdp::capability_sets::client_codecs_capabilities(&["remotefx:on"]).expect("codecs"),
+        }),
+        ..default_client_config()
+    };
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(Box::pin(async move {
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run().await;
+            });
+
+            let server_addr = local_addr_of(&ev).await;
+            let egfx = TestEgfxClient::default();
+            let egfx_channel = Arc::clone(&egfx.channel_id);
+            let (mut framed, connection_result) = connect_client(server_addr, |client_addr| {
+                connector::ClientConnector::new(client_config, client_addr)
+                    .with_static_channel(DrdynvcClient::new().with_dynamic_channel(egfx))
+            })
+            .await;
+            let activation_factory = connection_result.activation_factory;
+            let mut stage = ActiveStageBuilder {
+                static_channels: connection_result.static_channels,
+                user_channel_id: connection_result.user_channel_id,
+                io_channel_id: connection_result.io_channel_id,
+                message_channel_id: connection_result.message_channel_id,
+                share_id: connection_result.share_id,
+                compression_type: connection_result.compression_type,
+                enable_server_pointer: connection_result.enable_server_pointer,
+                pointer_software_rendering: connection_result.pointer_software_rendering,
+            }
+            .build();
+            let mut image = DecodedImage::new(PixelFormat::RgbA32, DESKTOP_WIDTH, DESKTOP_HEIGHT);
+
+            // The server applies the window at activation, before it creates the
+            // EGFX channel.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while egfx_channel.lock().unwrap().is_none() {
+                assert!(Instant::now() < deadline, "the server did not create the EGFX channel");
+                let Ok(read) = tokio::time::timeout(Duration::from_millis(150), framed.read_pdu()).await else {
+                    continue;
+                };
+                let (action, frame) = read.expect("read PDU");
+                for output in stage.process(&mut image, action, &frame, None).expect("stage process") {
+                    if let ActiveStageOutput::ResponseFrame(frame) = output {
+                        framed.write_all(&frame).await.expect("write response frame");
+                    }
+                }
+            }
+
+            let pipeline = || Arc::clone(handles.lock().unwrap().last().expect("an EGFX pipeline"));
+            let first = pipeline().lock().unwrap().max_frames_in_flight();
+
+            pipeline()
+                .lock()
+                .unwrap()
+                .set_client_frame_ack_limit(NonZeroU32::new(1));
+            display_tx
+                .send(DisplayUpdate::Resize(DesktopSize {
+                    width: 2048,
+                    height: 2048,
+                }))
+                .unwrap();
+            'deactivated: loop {
+                let (action, frame) = tokio::time::timeout(Duration::from_secs(10), framed.read_pdu())
+                    .await
+                    .expect("the server deactivated the session")
+                    .expect("read PDU");
+                for output in stage.process(&mut image, action, &frame, None).expect("stage process") {
+                    match output {
+                        ActiveStageOutput::ResponseFrame(frame) => {
+                            framed.write_all(&frame).await.expect("write response frame");
+                        }
+                        ActiveStageOutput::DeactivateAll => break 'deactivated,
+                        _ => {}
+                    }
+                }
+            }
+            run_reactivation(&mut stage, &activation_factory, &mut framed).await;
+
+            // The server applies the window when it accepts the reactivated
+            // client, after the client's side of the sequence completes.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut second = pipeline().lock().unwrap().max_frames_in_flight();
+            while second != first && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                second = pipeline().lock().unwrap().max_frames_in_flight();
+            }
+
+            drop(framed);
+            server_task.abort();
+            (first, second)
+        }))
+        .await
+}
+
+/// EGFX factory that keeps each pipeline it builds, with a window of 30 frames.
+struct WindowGfxFactory {
+    handles: Arc<StdMutex<Vec<ironrdp_server::GfxServerHandle>>>,
+}
+
+impl ServerEventSender for WindowGfxFactory {
+    fn set_sender(&mut self, _sender: UnboundedSender<ServerEvent>) {}
+}
+
+impl GfxServerFactory for WindowGfxFactory {
+    fn build_gfx_handler(&self, _: GfxContext) -> Box<dyn ironrdp_egfx::server::GraphicsPipelineHandler> {
+        Box::new(TestGfxHandler {
+            caps_tx: mpsc::unbounded_channel().0,
+        })
+    }
+
+    fn build_server_with_handle(
+        &self,
+        ctx: GfxContext,
+    ) -> Option<(ironrdp_server::GfxDvcBridge, ironrdp_server::GfxServerHandle)> {
+        let mut server = ironrdp_egfx::server::GraphicsPipelineServer::new(self.build_gfx_handler(ctx));
+        server.set_max_frames_in_flight(30);
+        let handle = Arc::new(StdMutex::new(server));
+        self.handles.lock().unwrap().push(Arc::clone(&handle));
+        Some((ironrdp_server::GfxDvcBridge::new(Arc::clone(&handle)), handle))
+    }
+}
+
 /// Server EGFX handler that reports the client's advertised capabilities.
 struct TestGfxFactory {
     caps_tx: UnboundedSender<()>,
@@ -1766,7 +2306,7 @@ impl ServerEventSender for TestGfxFactory {
 }
 
 impl GfxServerFactory for TestGfxFactory {
-    fn build_gfx_handler(&self) -> Box<dyn ironrdp_egfx::server::GraphicsPipelineHandler> {
+    fn build_gfx_handler(&self, _: GfxContext) -> Box<dyn ironrdp_egfx::server::GraphicsPipelineHandler> {
         Box::new(TestGfxHandler {
             caps_tx: self.caps_tx.clone(),
         })
@@ -2329,6 +2869,7 @@ pub(super) fn default_client_config() -> connector::Config {
         pointer_software_rendering: true,
         multitransport_flags: None,
         support_dyn_vc_gfx_protocol: false,
+        rdp_version: gcc::RdpVersion::V5_PLUS,
         performance_flags: Default::default(),
         timezone_info: Default::default(),
         alternate_shell: String::new(),
@@ -2345,6 +2886,18 @@ async fn connect_client(
     server_addr: SocketAddr,
     make_connector: impl FnOnce(SocketAddr) -> connector::ClientConnector,
 ) -> (Framed<TokioStream<TlsStream<TcpStream>>>, connector::ConnectionResult) {
+    connect_client_with(server_addr, make_connector, |stream| stream).await
+}
+
+/// Connects like [`connect_client`], with the TLS stream wrapped by `wrap`.
+async fn connect_client_with<S>(
+    server_addr: SocketAddr,
+    make_connector: impl FnOnce(SocketAddr) -> connector::ClientConnector,
+    wrap: impl FnOnce(TlsStream<TcpStream>) -> S,
+) -> (Framed<TokioStream<S>>, connector::ConnectionResult)
+where
+    S: AsyncRead + AsyncWrite + Send + Sync + Unpin,
+{
     let tcp_stream = TcpStream::connect(server_addr).await.expect("TCP connect");
     let client_addr = tcp_stream.local_addr().expect("local_addr");
     let mut framed = ironrdp_tokio::TokioFramed::new(tcp_stream);
@@ -2361,8 +2914,8 @@ async fn connect_client(
     .await
     .expect("TLS upgrade");
     let upgraded = ironrdp_tokio::mark_as_upgraded(should_upgrade, &mut connector);
-    let mut upgraded_framed = ironrdp_tokio::TokioFramed::new(upgraded_stream);
     let server_public_key = ironrdp_tls::extract_tls_server_public_key(&tls_cert).expect("extract server public key");
+    let mut upgraded_framed = ironrdp_tokio::TokioFramed::new(wrap(upgraded_stream));
     let connection_result = ironrdp_async::connect_finalize(
         upgraded,
         connector,
@@ -2496,6 +3049,36 @@ async fn hooks_reaching_handler_under(policy: server::ConnectionPolicy) -> (bool
             (accept >= 1, info >= 1)
         })
         .await
+}
+
+// A client must not send PTRFLAGS_HWHEEL to a server that does not set TS_INPUT_FLAG_MOUSE_HWHEEL.
+// oracle: spec MS-RDPBCGR §2.2.8.1.1.3.1.1.3
+// oracle: regression #2235
+#[tokio::test]
+async fn server_advertises_horizontal_mouse_wheel_input() {
+    let (mut server, _counts, _display_tx) = hook_recording_server(server::ConnectionPolicy::Queue);
+    let ev = server.event_sender().clone();
+
+    let local = tokio::task::LocalSet::new();
+    let input_flags = local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move {
+                let _ = server.run().await;
+            });
+
+            let server_addr = local_addr_of(&ev).await;
+            let (client, connection_result) = connect_client(server_addr, |client_addr| {
+                connector::ClientConnector::new(default_client_config(), client_addr)
+            })
+            .await;
+
+            drop(client);
+            server_task.abort();
+            connection_result.input_flags
+        })
+        .await;
+
+    assert!(input_flags.contains(InputFlags::TS_MOUSE_HWHEEL), "{input_flags:?}");
 }
 
 #[tokio::test]

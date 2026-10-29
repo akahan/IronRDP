@@ -5,6 +5,14 @@ use core::time::Duration;
 use std::borrow::Cow;
 use std::rc::Rc;
 
+use crate::canvas::Canvas;
+use crate::clipboard;
+use crate::clipboard::{ClipboardData, FileMetadata, WasmClipboard, WasmClipboardBackend, WasmClipboardBackendMessage};
+use crate::error::IronError;
+use crate::image::extract_partial_image;
+use crate::input::InputTransaction;
+use crate::network_client::WasmNetworkClient;
+use crate::printer::{JsPrinterStreamCallbacks, WasmPrinter, WasmPrinterBackend, wasm_printer_pair};
 use anyhow::Context as _;
 use base64::Engine as _;
 use futures_channel::mpsc;
@@ -18,7 +26,7 @@ use ironrdp::cliprdr::CliprdrClient;
 use ironrdp::cliprdr::backend::ClipboardMessage;
 use ironrdp::cliprdr::pdu::{FileContentsFlags, FileContentsRequest, FileContentsResponse, FileDescriptor};
 use ironrdp::connector::connection_activation::ConnectionActivationState;
-use ironrdp::connector::credssp::KerberosConfig;
+use ironrdp::connector::credssp::{KdcResolution, KerberosConfig};
 use ironrdp::connector::{self, ClientConnector, Credentials};
 use ironrdp::displaycontrol::client::DisplayControlClient;
 use ironrdp::dvc::DrdynvcClient;
@@ -39,15 +47,6 @@ use tracing::{debug, error, info, trace, warn};
 use wasm_bindgen::{JsCast as _, JsValue};
 use wasm_bindgen_futures::spawn_local;
 use web_sys::HtmlCanvasElement;
-
-use crate::canvas::Canvas;
-use crate::clipboard;
-use crate::clipboard::{ClipboardData, FileMetadata, WasmClipboard, WasmClipboardBackend, WasmClipboardBackendMessage};
-use crate::error::IronError;
-use crate::image::extract_partial_image;
-use crate::input::InputTransaction;
-use crate::network_client::WasmNetworkClient;
-use crate::printer::{JsPrinterStreamCallbacks, WasmPrinter, WasmPrinterBackend, wasm_printer_pair};
 
 const DEFAULT_WIDTH: u16 = 1280;
 const DEFAULT_HEIGHT: u16 = 720;
@@ -1583,6 +1582,7 @@ fn build_config(
         pointer_software_rendering: false,
         multitransport_flags: None,
         support_dyn_vc_gfx_protocol: false,
+        rdp_version: ironrdp::pdu::gcc::RdpVersion::V5_PLUS,
         performance_flags: PerformanceFlags::default(),
         desktop_scale_factor: 0,
         desktop_physical_size: None,
@@ -1741,7 +1741,7 @@ async fn connect(
     let kerberos_config = url::Url::parse(kdc_proxy_url.unwrap_or_default().as_str())
         .ok()
         .map(|url| KerberosConfig {
-            kdc_proxy_url: Some(url),
+            kdc_resolution: KdcResolution::KdcUrl(Some(url)),
             // HACK: It's supposed to be the computer name of the client, but since it's not easy to retrieve this information in the browser,
             // we set the destination hostname instead because it happens to work.
             hostname: destination.clone(),
@@ -1911,7 +1911,8 @@ where
                     error.http_status_code,
                     error.wsa_last_error,
                     error.tls_alert_code,
-                );
+                )
+                .with_error_code(error.error_code);
                 return Err(
                     IronError::from(anyhow::Error::new(error).context("received an RDCleanPath error"))
                         .with_kind(IronErrorKind::RDCleanPath)
@@ -2221,6 +2222,46 @@ mod tests {
             "unexpected error: {}",
             error.backtrace()
         );
+    }
+
+    #[test]
+    fn rdcleanpath_error_exposes_error_code() {
+        let response = ironrdp_rdcleanpath::RDCleanPathPdu {
+            error: Some(ironrdp_rdcleanpath::RDCleanPathErr {
+                error_code: ironrdp_rdcleanpath::EXPIRED_ERROR_CODE,
+                http_status_code: Some(401),
+                wsa_last_error: None,
+                tls_alert_code: None,
+            }),
+            ..Default::default()
+        }
+        .to_der()
+        .expect("encode RDCleanPath error");
+        let mut framed = rdcleanpath_framed(&response);
+        let mut connector = ClientConnector::new(
+            connector_config(SecurityConfig {
+                enable_credssp: false,
+                enable_standard_rdp_security: false,
+            }),
+            core::net::SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 33899)),
+        );
+        let mut network_client = WasmNetworkClient;
+
+        let error = match connect_rdcleanpath(
+            &mut framed,
+            &mut connector,
+            &mut network_client,
+            rdcleanpath_connect_params(),
+        )
+        .now_or_never()
+        .expect("in-memory RDCleanPath I/O should be ready")
+        {
+            Ok(_) => panic!("RDCleanPath error accepted as a response"),
+            Err(error) => error,
+        };
+
+        let details = error.rdcleanpath_details().expect("RDCleanPath error details");
+        assert_eq!(details.error_code(), Some(ironrdp_rdcleanpath::EXPIRED_ERROR_CODE));
     }
 
     #[test]

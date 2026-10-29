@@ -33,7 +33,8 @@ use ironrdp_pdu::input::InputEventPdu;
 use ironrdp_pdu::input::fast_path::{FastPathInput, FastPathInputEvent};
 use ironrdp_pdu::mcs::{SendDataIndication, SendDataRequest};
 use ironrdp_pdu::rdp::capability_sets::{
-    BitmapCodecs, CapabilitySet, CmdFlags, CodecProperty, EntropyBits, GeneralExtraFlags, LargePointerSupportFlags,
+    BitmapCodecs, CapabilitySet, CmdFlags, Codec, CodecProperty, EntropyBits, GeneralExtraFlags,
+    LargePointerSupportFlags, RemoteFxContainer,
 };
 pub use ironrdp_pdu::rdp::client_info::Credentials;
 use ironrdp_pdu::rdp::headers::{ServerDeactivateAll, ShareControlPdu};
@@ -61,10 +62,10 @@ use crate::autodetect::{AutoDetectHandles, AutoDetectManager, AutoDetectOutcome}
 use crate::clipboard::CliprdrServerFactory;
 use crate::display::{DisplayContext, DisplayUpdate, RdpServerDisplay, RdpServerDisplayUpdates};
 use crate::echo::{EchoDvcBridge, EchoServerHandle, EchoServerMessage, build_echo_request};
-use crate::encoder::{UpdateEncoder, UpdateEncoderCodecs};
+use crate::encoder::{MAX_FASTPATH_UPDATE_SIZE, RemoteFxCodec, UpdateEncoder, UpdateEncoderCodecs};
 use crate::error::{ServerError, ServerErrorExt as _, ServerErrorKind, ServerResult};
 #[cfg(feature = "egfx")]
-use crate::gfx::{EgfxServerMessage, GfxServerFactory};
+use crate::gfx::{EgfxServerMessage, GfxContext, GfxServerFactory, GfxServerHandle};
 use crate::handler::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
 use crate::heartbeat::HeartbeatConfig;
 use crate::multitransport;
@@ -94,6 +95,44 @@ fn client_core_frame_ack_limit(capabilities: &[CapabilitySet]) -> Option<NonZero
         _ => None,
     })
 }
+
+/// The Fast-Path Update size the client can reassemble, capped by the server's own.
+///
+/// A client's [MaxRequestSize] is the size of its reassembly buffer, which caps the largest
+/// fragmented Fast-Path Update it can take. A client that sends no Multifragment Update
+/// Capability Set, or a zero size, leaves the server's in place.
+///
+/// Neither value is taken below one Fast-Path fragment: an update that size is sent
+/// unfragmented and never reaches the reassembly buffer, and a smaller value would only make
+/// the encoder cut every frame into tiny tiles, or refuse every update at zero.
+///
+/// [MaxRequestSize]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/01717954-716a-424d-af35-28fb2b86df89
+#[cfg_attr(feature = "__test", visibility::make(pub))]
+fn client_max_request_size(server_max_request_size: u32, capabilities: &[CapabilitySet]) -> u32 {
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_possible_truncation,
+        reason = "try_from is not const; the assertion fails the build if the fragment size outgrows a u32"
+    )]
+    const ONE_FRAGMENT: u32 = {
+        assert!(MAX_FASTPATH_UPDATE_SIZE <= u32::MAX as usize);
+        MAX_FASTPATH_UPDATE_SIZE as u32
+    };
+
+    let server_max_request_size = server_max_request_size.max(ONE_FRAGMENT);
+    capabilities
+        .iter()
+        .find_map(|capability| match capability {
+            CapabilitySet::MultiFragmentUpdate(capability) if capability.max_request_size != 0 => {
+                Some(capability.max_request_size)
+            }
+            _ => None,
+        })
+        .map_or(server_max_request_size, |client| {
+            client.max(ONE_FRAGMENT).min(server_max_request_size)
+        })
+}
+
 const AUTO_RECONNECT_COOKIE_UPDATE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// How often the server drives [`CliprdrServer::drive_timeouts`].
@@ -189,6 +228,10 @@ pub struct ConnectionInfo {
     pub redirected_session_id: Option<u32>,
     /// See [`ironrdp_acceptor::AcceptorResult::password_cookie`].
     pub password_cookie: Option<rdp::client_info::PasswordCookie>,
+    /// See [`ironrdp_acceptor::AcceptorResult::client_info_flags`].
+    /// The server itself doesn't start the rdpsnd channel when they ask for no audio redirection; the rest, such as
+    /// whether to offer a microphone, is the embedder's to act on.
+    pub client_info_flags: rdp::client_info::ClientInfoFlags,
 }
 
 impl ConnectionInfo {
@@ -206,6 +249,7 @@ impl ConnectionInfo {
             routing_token: None,
             redirected_session_id: None,
             password_cookie: None,
+            client_info_flags: rdp::client_info::ClientInfoFlags::empty(),
         }
     }
 }
@@ -809,6 +853,44 @@ pub fn pick_remotefx_entropy_coder(
     first
 }
 
+/// Picks the RemoteFX codec, its codec id and entropy coder out of the client's
+/// [2.2.7.2.10.1.1] Bitmap Codec (TS_BITMAPCODEC) list.
+///
+/// `CODEC_GUID_REMOTEFX` wins over `CODEC_GUID_IMAGE_REMOTEFX` whatever the order of the
+/// client's list, so that the choice, and with it the surface command that carries the data,
+/// does not depend on that order. Each codec is a candidate only when the server enables it.
+///
+/// [2.2.7.2.10.1.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/86507fed-a0ee-4242-b802-237534a8f65e
+#[cfg_attr(feature = "__test", visibility::make(pub))]
+fn pick_remotefx_codec(
+    preferred: Option<EntropyBits>,
+    codecs: &[Codec],
+    remote_fx: bool,
+    image_remote_fx: bool,
+) -> Option<(EntropyBits, u8, RemoteFxCodec)> {
+    let pick = |wanted: RemoteFxCodec| {
+        codecs.iter().find_map(|codec| {
+            let caps = match (&codec.property, wanted) {
+                (CodecProperty::RemoteFx(RemoteFxContainer::ClientContainer(c)), RemoteFxCodec::RemoteFx)
+                | (CodecProperty::ImageRemoteFx(RemoteFxContainer::ClientContainer(c)), RemoteFxCodec::ImageRemoteFx) => {
+                    c
+                }
+                _ => return None,
+            };
+            let offered = caps.caps_data.0.0.iter().map(|icap| icap.entropy_bits);
+            pick_remotefx_entropy_coder(preferred, offered).map(|entropy_bits| (entropy_bits, codec.id, wanted))
+        })
+    };
+
+    [
+        (RemoteFxCodec::RemoteFx, remote_fx),
+        (RemoteFxCodec::ImageRemoteFx, image_remote_fx),
+    ]
+    .into_iter()
+    .filter(|&(_, enabled)| enabled)
+    .find_map(|(codec, _)| pick(codec))
+}
+
 #[derive(Clone)]
 pub enum RdpServerSecurity {
     None,
@@ -1227,8 +1309,6 @@ pub struct RdpServer {
     echo_handle: EchoServerHandle,
     #[cfg(feature = "egfx")]
     gfx_factory: Option<Box<dyn GfxServerFactory>>,
-    #[cfg(feature = "egfx")]
-    gfx_handle: Option<crate::gfx::GfxServerHandle>,
     #[cfg(feature = "usb")]
     usb_factory: Option<Box<dyn DeviceFactory>>,
     ev_sender: mpsc::UnboundedSender<ServerEvent>,
@@ -1288,6 +1368,10 @@ pub struct RdpServer {
     /// client that came back with a verified one; see
     /// [`Self::set_auto_reconnect_on_request`].
     auto_reconnect_on_request: bool,
+    /// Whether the client's core Frame Acknowledge capability caps the EGFX
+    /// frame window; see [`Self::set_egfx_core_frame_ack_limit`].
+    #[cfg(feature = "egfx")]
+    egfx_core_frame_ack_limit: bool,
 }
 
 /// Cloneable handle for updating the Server Auto-Reconnect Cookie while
@@ -1525,10 +1609,9 @@ enum NegotiatedTransport<S> {
 ///
 /// Owns a cloned `RdpServerSecurity` rather than borrowing `&self.opts.security`
 /// — `RdpServerSecurity` is a cheap `Clone` (its `TlsAcceptor` is an `Arc`
-/// underneath) — deliberately: a caller in `run_connection_with` needs `&mut
-/// self` (for `attach_channels`) while a live `PendingConnection` is still in
-/// scope, which a borrowed `security` would conflict with for as long as the
-/// pending connection exists.
+/// underneath) — deliberately: a preempting candidate negotiates through
+/// [`negotiate_candidate`] from a [`NegotiationContext`] snapshot, without
+/// holding the server at all.
 struct PendingConnection {
     security: RdpServerSecurity,
     acceptor: Acceptor,
@@ -1612,14 +1695,6 @@ impl PendingConnection {
             acceptor,
             credentials_handler,
         }
-    }
-
-    /// Mutable access to the acceptor for the one thing that must happen
-    /// before negotiation: attaching static/dynamic channels. Negotiation
-    /// itself (`negotiate_and_authenticate`) owns the acceptor from here on,
-    /// so this is only available pre-negotiation.
-    fn acceptor_mut(&mut self) -> &mut Acceptor {
-        &mut self.acceptor
     }
 
     /// Negotiate `stream` and, where the security mode provides it,
@@ -1760,6 +1835,8 @@ struct ConnectionState {
     /// client, which accumulates them and locks up its input dispatch for
     /// seconds on refocus while it chews through the backlog.
     display_suppressed: Arc<AtomicBool>,
+    #[cfg(feature = "egfx")]
+    gfx_handle: Option<GfxServerHandle>,
     #[cfg(feature = "usb")]
     usb_man: ServerUsbManager,
     /// Abort handle of this connection's pending UDP multitransport accept,
@@ -1793,6 +1870,10 @@ struct ConnectionState {
     /// eligible for the hourly update when cookies are on request (see
     /// [`RdpServer::set_auto_reconnect_on_request`]).
     auto_reconnect_issued: bool,
+    /// The client's Pointer Capability Set (MS-RDPBCGR 2.2.7.1.5) from the last activation, for
+    /// [`DisplayContext::pointer_cache_size`] and [`DisplayContext::color_pointer_cache_size`].
+    pointer_cache_size: u16,
+    color_pointer_cache_size: u16,
 }
 
 impl ConnectionState {
@@ -1803,6 +1884,10 @@ impl ConnectionState {
         DisplayContext {
             display_suppressed: Arc::clone(&self.display_suppressed),
             autodetect: self.autodetect_handles.clone(),
+            #[cfg(feature = "egfx")]
+            gfx_handle: self.gfx_handle.clone(),
+            pointer_cache_size: self.pointer_cache_size,
+            color_pointer_cache_size: self.color_pointer_cache_size,
         }
     }
 
@@ -2199,8 +2284,6 @@ impl RdpServer {
             echo_handle: EchoServerHandle::new(ev_sender.clone()),
             #[cfg(feature = "egfx")]
             gfx_factory,
-            #[cfg(feature = "egfx")]
-            gfx_handle: None,
             #[cfg(feature = "usb")]
             usb_factory,
             ev_sender,
@@ -2219,6 +2302,8 @@ impl RdpServer {
             previous_auto_reconnect_cookie: None,
             auto_reconnect_sent: false,
             auto_reconnect_on_request: false,
+            #[cfg(feature = "egfx")]
+            egfx_core_frame_ack_limit: false,
         }
     }
 
@@ -2309,6 +2394,25 @@ impl RdpServer {
     /// effect there.
     pub fn set_auto_reconnect_on_request(&mut self, on_request: bool) {
         self.auto_reconnect_on_request = on_request;
+    }
+
+    /// Choose whether the client's `maxUnacknowledgedFrameCount` caps the EGFX
+    /// frame window. Off by default.
+    ///
+    /// The value comes from the [2.2.1.3] Frame Acknowledge Capability Set
+    /// (TS_FRAME_ACKNOWLEDGE_CAPABILITYSET), which is defined for surface-command
+    /// frames acknowledged with TS_FRAME_ACKNOWLEDGE_PDU. EGFX acknowledges its
+    /// frames with its own [2.2.2.13] RDPGFX_FRAME_ACKNOWLEDGE_PDU, and Windows 10
+    /// mstsc sends 1, which would allow one EGFX frame per round trip. When on,
+    /// the value caps [`GraphicsPipelineServer::set_max_frames_in_flight`] for
+    /// each capability exchange, including reactivation.
+    ///
+    /// [2.2.1.3]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdprfx/e4d498fd-822b-408d-b8b3-1c216f21265b
+    /// [2.2.2.13]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/0241e258-77ef-4a58-b426-5039ed6296ce
+    /// [`GraphicsPipelineServer::set_max_frames_in_flight`]: ironrdp_egfx::server::GraphicsPipelineServer::set_max_frames_in_flight
+    #[cfg(feature = "egfx")]
+    pub fn set_egfx_core_frame_ack_limit(&mut self, enabled: bool) {
+        self.egfx_core_frame_ack_limit = enabled;
     }
 
     /// Returns a handle for replacing the cookie while [`Self::run`] owns this
@@ -2616,18 +2720,11 @@ impl RdpServer {
         self.heartbeat = Some(config);
     }
 
-    /// Returns the shared EGFX server handle for proactive frame submission.
-    ///
-    /// Available after `build_server_with_handle()` returns `Some` during
-    /// channel setup. Display handlers use this to call
-    /// `send_avc420_frame()` / `send_avc444_frame()` and then signal the
-    /// event loop via `ServerEvent::Egfx`.
-    #[cfg(feature = "egfx")]
-    pub fn gfx_handle(&self) -> Option<&crate::gfx::GfxServerHandle> {
-        self.gfx_handle.as_ref()
-    }
+    /// Builds this connection's channel backends into `acceptor` and returns the
+    /// connection's state, holding the handles those backends were given.
+    async fn attach_channels(&self, acceptor: &mut Acceptor) -> ConnectionState {
+        let autodetect_handles = AutoDetectHandles::default();
 
-    async fn attach_channels(&mut self, acceptor: &mut Acceptor) {
         if let Some(cliprdr_factory) = self.cliprdr_factory.as_deref() {
             let backend = cliprdr_factory.build_cliprdr_backend();
 
@@ -2690,14 +2787,18 @@ impl RdpServer {
         };
 
         #[cfg(feature = "egfx")]
-        let dvc = {
+        let (dvc, gfx_handle) = {
             let mut dvc = dvc;
+            let mut gfx_handle = None;
             if let Some(gfx_factory) = self.gfx_factory.as_deref() {
-                let (processor, handle) = crate::gfx::build_server_and_handle(gfx_factory);
-                self.gfx_handle = Some(handle);
+                let gfx_context = GfxContext {
+                    autodetect: autodetect_handles.clone(),
+                };
+                let (processor, handle) = crate::gfx::build_server_and_handle(gfx_factory, gfx_context);
+                gfx_handle = Some(handle);
                 dvc = dvc.with_dynamic_channel(processor);
             }
-            dvc
+            (dvc, gfx_handle)
         };
 
         #[cfg(feature = "usb")]
@@ -2715,6 +2816,27 @@ impl RdpServer {
 
         for factory in &self.static_channel_factories {
             factory.attach(acceptor);
+        }
+
+        ConnectionState {
+            static_channels: StaticChannelSet::new(),
+            client_supports_heartbeat: false,
+            client_supports_errinfo: false,
+            autodetect: self.autodetect_enabled.then(AutoDetectManager::new),
+            autodetect_handles,
+            display_suppressed: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "egfx")]
+            gfx_handle,
+            #[cfg(feature = "usb")]
+            usb_man: ServerUsbManager::default(),
+            pending_udp_accept_abort: None,
+            soft_sync_negotiated: false,
+            udp_migration_allowed: false,
+            egfx_on_udp: false,
+            early_tunnel_payloads: VecDeque::new(),
+            auto_reconnect_issued: false,
+            pointer_cache_size: 0,
+            color_pointer_cache_size: 0,
         }
     }
 
@@ -2801,24 +2923,14 @@ impl RdpServer {
     }
 
     /// Serve a candidate that already won the preemption race: negotiation and
-    /// authentication are done, so this is where its channel backends are
-    /// finally built (see the body comment below for why only now) before
-    /// handing off to the same finalization the normal path uses. From here
-    /// on, a preemption winner is indistinguishable from a normally-accepted
+    /// authentication are done, so it hands off to the same finalization the
+    /// normal path uses, which builds its channel backends. From here on, a
+    /// preemption winner is indistinguishable from a normally-accepted
     /// connection.
     async fn serve_negotiated<S>(&mut self, candidate: Box<NegotiatedConnection<S>>) -> ServerResult<()>
     where
         S: AsyncRead + AsyncWrite + Send + Sync + Unpin,
     {
-        let mut candidate = candidate;
-        // Only NOW build the channel backends: this connection has
-        // authenticated and is about to be served, so the factories run
-        // exactly once per served session, as they always have. Still ahead of
-        // `accept_finalize`, which is where the acceptor first consumes the
-        // static channel set (the MCS Connect Initial); `accept_begin`, already
-        // done, stops at the security-upgrade gate before that.
-        self.attach_channels(&mut candidate.acceptor).await;
-
         self.finalize_negotiated(*candidate).await
     }
 
@@ -2936,7 +3048,9 @@ impl RdpServer {
     where
         S: AsyncRead + AsyncWrite + Send + Sync + Unpin,
     {
-        let result = self.run_connection_inner(stream, tls).await;
+        // Boxed to keep this future, and `run_connection`'s, under `clippy::large_futures`, so a caller awaiting either
+        // doesn't have to.
+        let result = Box::pin(self.run_connection_inner(stream, tls)).await;
         // Given for this connection only; see `set_connection_local_addr`.
         self.connection_local_addr = None;
         result
@@ -2955,7 +3069,7 @@ impl RdpServer {
 
         let size = self.display.lock().await.size().await;
         let capabilities = capabilities::capabilities(&self.opts, size);
-        let mut pending = PendingConnection::new(
+        let pending = PendingConnection::new(
             self.opts.security.clone(),
             size,
             capabilities,
@@ -2968,8 +3082,6 @@ impl RdpServer {
                 ..ServerCredentialsHandler::default()
             },
         );
-
-        self.attach_channels(pending.acceptor_mut()).await;
 
         let Some(negotiated) = pending.negotiate_and_authenticate(stream, tls).await? else {
             return Ok(());
@@ -3010,28 +3122,17 @@ impl RdpServer {
         if local_addr.is_some() {
             self.connection_local_addr = local_addr;
         }
-        // Both entry paths, `run_connection_inner` and the preemption winner's
-        // `serve_negotiated`, reach this point, so dropping the state when this
-        // function returns releases it on every way out of a connection. In
-        // particular the static channel backends own real resources (an rdpsnd
-        // handler is stopped through `Drop`), which must not stay live until
-        // the next client attaches new ones.
-        let mut conn = ConnectionState {
-            autodetect: self.autodetect_enabled.then(AutoDetectManager::new),
-            ..ConnectionState::default()
-        };
         match transport {
             // No security upgrade happened, so there is no TLS session to shut
             // down — matches the pre-existing `BeginResult::Continue` arm.
             NegotiatedTransport::Continued(framed) => {
-                self.accept_finalize(&mut conn, framed, acceptor).await?;
+                self.accept_finalize(framed, acceptor).await?;
             }
             NegotiatedTransport::Tls(framed) => {
-                self.finalize_and_shutdown(&mut conn, *framed, acceptor, "TLS connection")
-                    .await?;
+                self.finalize_and_shutdown(*framed, acceptor, "TLS connection").await?;
             }
             NegotiatedTransport::Offloaded(framed) => {
-                self.finalize_and_shutdown(&mut conn, framed, acceptor, "TLS-offloaded stream")
+                self.finalize_and_shutdown(framed, acceptor, "TLS-offloaded stream")
                     .await?;
             }
         }
@@ -3045,7 +3146,6 @@ impl RdpServer {
     /// shares.
     async fn finalize_and_shutdown<S>(
         &mut self,
-        conn: &mut ConnectionState,
         framed: TokioFramed<S>,
         acceptor: Acceptor,
         shutdown_label: &str,
@@ -3058,7 +3158,7 @@ impl RdpServer {
         // `PendingConnection::negotiate_and_authenticate` before this function
         // ever runs -- upstream's un-refactored equivalent still does that
         // work at this point, since it has no separate negotiation step.
-        let framed = self.accept_finalize(conn, framed, acceptor).await?;
+        let framed = self.accept_finalize(framed, acceptor).await?;
         debug!("Shutting down {}", shutdown_label);
         let (mut inner, _) = framed.into_inner();
         if let Err(e) = inner.shutdown().await {
@@ -5119,32 +5219,22 @@ impl RdpServer {
                         })
                         .map(|cluster| cluster.redirected_session_id),
                     password_cookie: result.password_cookie.clone(),
+                    client_info_flags: result.client_info_flags,
                 });
             });
         }
 
-        if !result.input_events.is_empty() {
-            debug!("Handling input event backlog from acceptor sequence");
-            // Set on a reactivation pass, where EGFX may already be on the tunnel.
-            let current_udp_transport = udp_transport.borrow().clone();
-            self.handle_input_backlog(
-                conn,
-                writer,
-                result.io_channel_id,
-                result.user_channel_id,
-                result.message_channel_id,
-                result.input_events,
-                current_udp_transport.as_ref(),
-            )
-            .await?;
-        }
-
         #[cfg(feature = "egfx")]
-        if let Some(gfx_handle) = self.gfx_handle.as_ref() {
+        if let Some(gfx_handle) = conn.gfx_handle.as_ref() {
             let mut server = gfx_handle
                 .lock()
                 .map_err(|_| ServerError::reason("graphics server", "GfxServerHandle mutex poisoned"))?;
-            server.set_client_frame_ack_limit(client_core_frame_ack_limit(&result.capabilities));
+            let core_limit = if self.egfx_core_frame_ack_limit {
+                client_core_frame_ack_limit(&result.capabilities)
+            } else {
+                None
+            };
+            server.set_client_frame_ack_limit(core_limit);
         }
         conn.static_channels = result.static_channels;
         conn.client_supports_heartbeat = result
@@ -5153,12 +5243,23 @@ impl RdpServer {
         conn.client_supports_errinfo = result
             .client_early_capability_flags
             .contains(ironrdp_pdu::gcc::ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU);
+        // A client can join the rdpsnd channel although it asked for no audio redirection, as some do for device
+        // redirection, so the channel is left joined but never started: no Server Audio Formats PDU goes out, and the
+        // sound handler is never asked to start.
+        let audio_redirection = audio_redirection_wanted(result.client_info_flags);
         if !result.reactivation {
             for (_channel_key, channel, channel_id) in conn.static_channels.iter_by_key_mut() {
                 debug!(?channel, ?channel_id, "Start");
                 let Some(channel_id) = channel_id else {
                     continue;
                 };
+                if !audio_redirection && channel.channel_name() == RdpsndServer::NAME {
+                    debug!(
+                        flags = ?result.client_info_flags,
+                        "Not starting rdpsnd: the client asked for no audio redirection"
+                    );
+                    continue;
+                }
                 let svc_responses = channel.start().map_err_kind("svc start", ServerErrorKind::Pdu)?;
                 let response = server_encode_svc_messages(svc_responses, channel_id, result.user_channel_id)
                     .map_err(ServerError::encode)?;
@@ -5172,10 +5273,12 @@ impl RdpServer {
         let mut update_codecs = UpdateEncoderCodecs::new();
         let mut surface_flags = CmdFlags::empty();
         let mut pointer_cache_size: u16 = 0;
+        let mut color_pointer_cache_size: u16 = 0;
         // Absence means the client did not send a Large Pointer Capability Set at all,
         // which per MS-RDPBCGR 2.2.7.2.7 leaves the pointer size ceiling at 32x32 (the
         // base Color/New Pointer Update limit with no large-pointer flags set).
         let mut large_pointer_flags = LargePointerSupportFlags::empty();
+        let max_request_size = client_max_request_size(self.opts.max_request_size, &result.capabilities);
         for c in result.capabilities {
             match c {
                 CapabilitySet::General(c) => {
@@ -5187,7 +5290,6 @@ impl RdpServer {
                 CapabilitySet::Bitmap(b) => {
                     if !b.desktop_resize_flag {
                         debug!("Desktop resize is not supported by the client");
-                        continue;
                     }
 
                     let client_size = DesktopSize {
@@ -5198,47 +5300,37 @@ impl RdpServer {
 
                     // It's problematic when the client didn't resize, as we send bitmap updates that don't fit.
                     // The client will likely drop the connection.
-                    if client_size.width < display_size.width || client_size.height < display_size.height {
+                    if (!b.desktop_resize_flag && client_size != display_size)
+                        || client_size.width < display_size.width
+                        || client_size.height < display_size.height
+                    {
                         // TODO: we may have different behaviour instead, such as clipping or scaling?
-                        warn!(
-                            "Client size doesn't fit the server size: {:?} < {:?}",
-                            client_size, display_size
-                        );
+                        warn!(?client_size, ?display_size, "Client size differs from the server size");
                     }
                 }
                 CapabilitySet::SurfaceCommands(c) => {
                     surface_flags = c.flags;
                 }
                 CapabilitySet::BitmapCodecs(BitmapCodecs(codecs)) => {
+                    // FIXME: The encoder operates in image mode only.
+                    //
+                    // See [MS-RDPRFX] 3.1.1.1 "State Machine" for the
+                    // implementation of the video mode, which allows
+                    // skipping the header for each image.
+                    //
+                    // We should distinguish parameters for both modes.
+                    if let Some(remotefx) = pick_remotefx_codec(
+                        self.opts.remotefx_entropy_coder,
+                        &codecs,
+                        self.opts.has_remote_fx(),
+                        self.opts.has_image_remote_fx(),
+                    ) {
+                        update_codecs.set_remotefx_codec(Some(remotefx));
+                        update_codecs.set_remotefx_quant(self.opts.remotefx_quant.clone());
+                    }
+
                     for codec in codecs {
                         match codec.property {
-                            // FIXME: The encoder operates in image mode only.
-                            //
-                            // See [MS-RDPRFX] 3.1.1.1 "State Machine" for
-                            // implementation of the video mode. which allows to
-                            // skip sending Header for each image.
-                            //
-                            // We should distinguish parameters for both modes.
-                            CodecProperty::RemoteFx(rdp::capability_sets::RemoteFxContainer::ClientContainer(c))
-                                if self.opts.has_remote_fx() =>
-                            {
-                                let offered = c.caps_data.0.0.iter().map(|caps| caps.entropy_bits);
-                                let preferred = self.opts.remotefx_entropy_coder;
-                                if let Some(entropy_bits) = pick_remotefx_entropy_coder(preferred, offered) {
-                                    update_codecs.set_remotefx(Some((entropy_bits, codec.id)));
-                                    update_codecs.set_remotefx_quant(self.opts.remotefx_quant.clone());
-                                }
-                            }
-                            CodecProperty::ImageRemoteFx(rdp::capability_sets::RemoteFxContainer::ClientContainer(
-                                c,
-                            )) if self.opts.has_image_remote_fx() => {
-                                let offered = c.caps_data.0.0.iter().map(|caps| caps.entropy_bits);
-                                let preferred = self.opts.remotefx_entropy_coder;
-                                if let Some(entropy_bits) = pick_remotefx_entropy_coder(preferred, offered) {
-                                    update_codecs.set_remotefx(Some((entropy_bits, codec.id)));
-                                    update_codecs.set_remotefx_quant(self.opts.remotefx_quant.clone());
-                                }
-                            }
                             #[cfg(feature = "nscodec")]
                             CodecProperty::NsCodec(client_ns) if self.opts.has_nscodec() => {
                                 // Re-use the client's confirmed color-loss
@@ -5268,6 +5360,7 @@ impl RdpServer {
                     // must not reference a cache slot via CachedPointer either, since nothing
                     // else in this crate populates that cache via the Color Pointer Update.
                     pointer_cache_size = p.pointer_cache_size;
+                    color_pointer_cache_size = p.color_pointer_cache_size;
                 }
                 CapabilitySet::LargePointer(lp) => {
                     // MS-RDPBCGR 2.2.7.2.7: LARGE_POINTER_FLAG_96x96 raises the Color/New
@@ -5281,15 +5374,34 @@ impl RdpServer {
             }
         }
 
+        if !result.input_events.is_empty() {
+            debug!("Handling input event backlog from acceptor sequence");
+            // Set on a reactivation pass, where EGFX may already be on the tunnel.
+            let current_udp_transport = udp_transport.borrow().clone();
+            self.handle_input_backlog(
+                conn,
+                writer,
+                result.io_channel_id,
+                result.user_channel_id,
+                result.message_channel_id,
+                result.input_events,
+                current_udp_transport.as_ref(),
+            )
+            .await?;
+        }
+
         let desktop_size = self.display.lock().await.size().await;
         let encoder = UpdateEncoder::new(
             desktop_size,
             surface_flags,
             update_codecs,
-            self.opts.max_request_size,
+            max_request_size,
             pointer_cache_size,
+            color_pointer_cache_size,
             large_pointer_flags,
         )?;
+        conn.pointer_cache_size = pointer_cache_size;
+        conn.color_pointer_cache_size = color_pointer_cache_size;
 
         // By default every connection gets a cookie at activation. On request, only one that came
         // back with a verified cookie does.
@@ -5705,13 +5817,13 @@ impl RdpServer {
 
     async fn accept_finalize<S>(
         &mut self,
-        conn: &mut ConnectionState,
         mut framed: TokioFramed<S>,
         mut acceptor: Acceptor,
     ) -> ServerResult<TokioFramed<S>>
     where
         S: AsyncRead + AsyncWrite + Sync + Send + Unpin,
     {
+        let mut conn = self.attach_channels(&mut acceptor).await;
         let udp_bind_addr = self
             .opts
             .udp_bind_addr
@@ -5787,7 +5899,7 @@ impl RdpServer {
 
             match self
                 .client_accepted(
-                    conn,
+                    &mut conn,
                     &mut reader,
                     &mut writer,
                     (result, &acceptor),
@@ -5923,6 +6035,18 @@ fn encode_autodetect_request(
 /// ([MS-RDPBCGR] 2.2.14.1).
 #[cfg(feature = "egfx")]
 const AUTODETECT_HEADER_SIZE: usize = 1 /* headerLength */ + 1 /* headerTypeId */;
+
+/// Whether a client's Info Packet flags let its audio be redirected to it, per MS-RDPBCGR [2.2.1.11.1.1] Info Packet
+/// (TS_INFO_PACKET): not under INFO_NOAUDIOPLAYBACK, where audio redirection MUST NOT take place, and not under
+/// INFO_REMOTECONSOLEAUDIO, which asks for the audio to be played on the server.
+///
+/// [2.2.1.11.1.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/732394f5-e2b5-4ac5-8a0a-35345386b0d1
+#[cfg_attr(feature = "__test", visibility::make(pub))]
+fn audio_redirection_wanted(flags: rdp::client_info::ClientInfoFlags) -> bool {
+    !flags.intersects(
+        rdp::client_info::ClientInfoFlags::NO_AUDIO_PLAYBACK | rdp::client_info::ClientInfoFlags::REMOTE_CONSOLE_AUDIO,
+    )
+}
 
 /// Carries an auto-detect request as an RDP_TUNNEL_SUBHEADER, alone in a
 /// Tunnel Data PDU of its own ([MS-RDPBCGR] 1.3.9, [MS-RDPEMT] 2.2.1.1.1).
@@ -6805,12 +6929,13 @@ mod preempt_tests {
 
     /// Regression guard for the "no happy-path test" review finding, and the
     /// load-bearing claim it's actually worried about: that deferring
-    /// `attach_channels` to `serve_negotiated` does NOT silently drop a
+    /// `attach_channels` past negotiation (it runs in `accept_finalize`,
+    /// which both connection entry paths reach) does NOT silently drop a
     /// preemption winner's channels. That claim rests entirely on
     /// `accept_begin` stopping at `AcceptorState::SecurityUpgrade` -- before
     /// `BasicSettingsWaitInitial` consumes `static_channels` -- for
     /// [`RdpServerSecurity::None`]. If a future `ironrdp-acceptor` change
-    /// moved that stop point, a preemption winner would negotiate ZERO static
+    /// moved that stop point, a connection would negotiate ZERO static
     /// channels (no clipboard, no sound, no DVC) and every OTHER test in this
     /// module would still pass, since none of them drive a candidate all the
     /// way to `serve_negotiated`.
@@ -7335,6 +7460,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_connection_releases_the_static_channels() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
         struct ResourceFactory(Arc<AtomicBool>);
         impl StaticChannelFactory for ResourceFactory {
             fn attach(&self, acceptor: &mut Acceptor) {
@@ -7351,11 +7478,24 @@ mod tests {
             .with_static_channel_factory(Box::new(ResourceFactory(Arc::clone(&released))))
             .build();
 
-        // A stream that is already at EOF: the connection ends early, which
-        // is the path an embedder's accept loop sees when a client vanishes.
-        let (client, server_side) = tokio::io::duplex(64);
-        drop(client);
-        let _ = server.run_connection(server_side).await;
+        // The client negotiates and then vanishes, so the connection ends in
+        // finalization, after its channel backends were built: the path an
+        // embedder's accept loop sees when a client drops mid-handshake.
+        let (mut client, server_side) = tokio::io::duplex(4096);
+        let client = async move {
+            let request = nego::ConnectionRequest {
+                nego_data: None,
+                flags: nego::RequestFlags::empty(),
+                protocol: nego::SecurityProtocol::empty(),
+                correlation_info: None,
+            };
+            let request = encode_vec(&X224(request)).expect("encode connection request");
+            client.write_all(&request).await.expect("send connection request");
+            let mut confirm = [0u8; 128];
+            let read = client.read(&mut confirm).await.expect("read connection confirm");
+            let _ = decode::<X224<nego::ConnectionConfirm>>(&confirm[..read]).expect("server answered the negotiation");
+        };
+        let _ = tokio::join!(server.run_connection(server_side), client);
 
         assert!(
             released.load(Ordering::Relaxed),

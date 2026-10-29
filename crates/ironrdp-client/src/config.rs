@@ -6,6 +6,8 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use ironrdp_cfg::PropertySetExt as _;
+pub use ironrdp_cfg::RemoteGuardMode;
+use ironrdp_connector::credssp::KdcResolution;
 use ironrdp_propertyset::PropertySet;
 use ironrdp_rail::pdu::ExecutePdu;
 use url::Url;
@@ -19,7 +21,6 @@ pub use ironrdp_cfg::DriveRedirection;
 pub use ironrdp_rdpeudp::pdu::UdpVersion;
 #[cfg(feature = "vmconnect")]
 pub use ironrdp_vmconnect::Mode as VmConnectMode;
-
 // ── Extension registry ────────────────────────────────────────────────────────
 
 type StaticChannelFn = Arc<dyn Fn(&mut ironrdp_connector::ClientConnector, &PropertySet) + Send + Sync>;
@@ -103,6 +104,14 @@ pub struct Config {
     pub(crate) udp_offer_version: UdpVersion,
     pub(crate) certificate_validation: ironrdp_tls::CertificateValidation,
     pub(crate) certificate_validation_callback: Option<ironrdp_tls::CertificateValidationCallback>,
+    #[cfg(feature = "entra-auth")]
+    pub(crate) entra_auth: Option<Arc<crate::entra::EntraAuthSession>>,
+    #[cfg(all(feature = "gateway", feature = "entra-auth"))]
+    pub(crate) avd_token_provider: Option<Arc<dyn crate::avd::AvdTokenProvider>>,
+    #[cfg(all(feature = "gateway", feature = "entra-auth"))]
+    pub(crate) avd_gateway_token: Option<zeroize::Zeroizing<String>>,
+    #[cfg(all(feature = "gateway", feature = "entra-auth"))]
+    pub(crate) avd_sso_logon_token: Option<zeroize::Zeroizing<String>>,
 
     #[cfg(feature = "vmconnect")]
     /// Hyper-V VM ID when connecting to a VM console (port [`ironrdp_vmconnect::PORT`]).
@@ -112,6 +121,7 @@ pub struct Config {
     #[cfg(all(windows, feature = "vmconnect"))]
     pub(crate) vmconnect_current_user: bool,
     pub(crate) kerberos_config: Option<ironrdp_connector::credssp::KerberosConfig>,
+    pub(crate) remote_guard_mode: RemoteGuardMode,
     pub(crate) input_send_interval: Option<Duration>,
     pub(crate) input_keepalive_interval: Option<Duration>,
     pub(crate) fake_events_interval: Option<Duration>,
@@ -225,6 +235,17 @@ impl Config {
         self.kerberos_config.as_ref()
     }
 
+    /// Required Remote Credential Guard policy.
+    pub fn remote_guard_mode(&self) -> RemoteGuardMode {
+        self.remote_guard_mode
+    }
+
+    #[cfg(feature = "__test")]
+    #[doc(hidden)]
+    pub fn __test_set_remote_guard_mode(&mut self, mode: RemoteGuardMode) {
+        self.remote_guard_mode = mode;
+    }
+
     /// Minimum interval between non-forced input batches.
     pub fn input_send_interval(&self) -> Option<Duration> {
         self.input_send_interval
@@ -324,6 +345,7 @@ impl fmt::Debug for Config {
             );
         }
         s.field("kerberos_config", &self.kerberos_config);
+        s.field("remote_guard_mode", &self.remote_guard_mode);
         s.field("input_send_interval", &self.input_send_interval);
         s.field("input_keepalive_interval", &self.input_keepalive_interval);
         s.field("fake_events_interval", &self.fake_events_interval);
@@ -416,6 +438,40 @@ pub struct ChannelConfig {
     #[cfg(feature = "location")]
     pub location: bool,
 
+    /// Launch URI that enables the Windows 365 virtual desktop control channel.
+    ///
+    /// Windows 365 Cloud PCs use the channel in Boot and Switch mode; `None` leaves it unregistered.
+    /// The URI's query parameters advertise the local actions the client supports, such as `supportBluetoothSettings=true`.
+    #[cfg(feature = "w365")]
+    pub virtual_desktop_switch: Option<String>,
+
+    /// Enable the Windows 365 battery status redirection channel.
+    ///
+    /// Supply readings with [`RdpInputEvent::BatteryStatus`](crate::rdp::RdpInputEvent::BatteryStatus).
+    /// Like Windows App, the client does not open the channel in RemoteApp sessions.
+    #[cfg(feature = "w365")]
+    pub battery_status: bool,
+
+    /// Enable the Windows 365 power request redirection channel.
+    ///
+    /// Changes arrive as [`RdpOutputEvent::PowerRequestsChanged`](crate::rdp::RdpOutputEvent::PowerRequestsChanged).
+    #[cfg(feature = "w365")]
+    pub power_request: bool,
+
+    /// Enable the Windows 365 screen capture redirection channel.
+    ///
+    /// Upload screenshots with [`RdpInputEvent::UploadScreenCapture`](crate::rdp::RdpInputEvent::UploadScreenCapture).
+    #[cfg(feature = "w365")]
+    pub screen_capture: bool,
+
+    /// Enable the `Microsoft::Windows::RDS::InteractiveEntraAuth` dynamic virtual channel, through which the session
+    /// host can ask for an interactive Microsoft Entra sign-in during the session.
+    ///
+    /// Off by default, like in Windows App. Requests arrive as
+    /// [`RdpOutputEvent::InteractiveEntraAuthRequested`](crate::rdp::RdpOutputEvent::InteractiveEntraAuthRequested).
+    #[cfg(feature = "entra-auth")]
+    pub interactive_entra_auth: bool,
+
     /// Maximum number of simultaneous touch contacts advertised in the RDPEI `CS_READY` PDU.
     ///
     /// Defaults to [`RDPEI_MAX_TOUCH_CONTACTS`](crate::rdp::RDPEI_MAX_TOUCH_CONTACTS).
@@ -472,6 +528,16 @@ impl Default for ChannelConfig {
             webauthn: true,
             #[cfg(feature = "location")]
             location: false,
+            #[cfg(feature = "w365")]
+            virtual_desktop_switch: None,
+            #[cfg(feature = "w365")]
+            battery_status: false,
+            #[cfg(feature = "w365")]
+            power_request: false,
+            #[cfg(feature = "w365")]
+            screen_capture: false,
+            #[cfg(feature = "entra-auth")]
+            interactive_entra_auth: false,
             max_touch_contacts: crate::rdp::RDPEI_MAX_TOUCH_CONTACTS,
             #[cfg(feature = "camera")]
             cameras: crate::camera::CameraConfig::default(),
@@ -869,6 +935,7 @@ pub struct ConfigBuilder {
     keyboard_functional_keys_count: Option<u32>,
     keyboard_layout: Option<u32>,
     connection_type: Option<ironrdp_pdu::gcc::ConnectionType>,
+    rdp_version: Option<ironrdp_pdu::gcc::RdpVersion>,
     ime_file_name: Option<String>,
     dig_product_id: Option<String>,
     desktop_width: Option<u16>,
@@ -915,7 +982,16 @@ pub struct ConfigBuilder {
     #[cfg(all(windows, feature = "vmconnect"))]
     vmconnect_current_user: bool,
     rdcleanpath_token: Option<String>,
+    #[cfg(feature = "entra-auth")]
+    entra_auth: Option<Arc<crate::entra::EntraAuthSession>>,
+    #[cfg(all(feature = "gateway", feature = "entra-auth"))]
+    avd_token_provider: Option<Arc<dyn crate::avd::AvdTokenProvider>>,
+    #[cfg(all(feature = "gateway", feature = "entra-auth"))]
+    avd_gateway_token: Option<zeroize::Zeroizing<String>>,
+    #[cfg(all(feature = "gateway", feature = "entra-auth"))]
+    avd_sso_logon_token: Option<zeroize::Zeroizing<String>>,
     kerberos_config: Option<ironrdp_connector::credssp::KerberosConfig>,
+    remote_guard_mode: RemoteGuardMode,
     input_send_interval: Option<Duration>,
     input_keepalive_interval: Option<Duration>,
     fake_events_interval: Option<Duration>,
@@ -1045,6 +1121,16 @@ impl ConfigBuilder {
     #[must_use]
     pub fn with_connection_type(mut self, connection_type: ironrdp_pdu::gcc::ConnectionType) -> Self {
         self.connection_type = Some(connection_type);
+        self
+    }
+
+    /// Set the RDP version announced in the GCC Client Core Data block.
+    ///
+    /// The default is [`RdpVersion::V5_PLUS`](ironrdp_pdu::gcc::RdpVersion::V5_PLUS), and it should not be lower.
+    /// See [`ironrdp_connector::Config::rdp_version`].
+    #[must_use]
+    pub fn with_rdp_version(mut self, rdp_version: ironrdp_pdu::gcc::RdpVersion) -> Self {
+        self.rdp_version = Some(rdp_version);
         self
     }
 
@@ -1317,6 +1403,28 @@ impl ConfigBuilder {
         self
     }
 
+    /// Require Microsoft Entra RDS AAD session authentication.
+    ///
+    /// Create the session with [`crate::entra::EntraAuthorization`] and pass it here.
+    /// This requires strictly validated TLS and never falls back to CredSSP or password authentication.
+    #[cfg(feature = "entra-auth")]
+    #[must_use]
+    pub fn with_entra_auth(mut self, auth: Arc<crate::entra::EntraAuthSession>) -> Self {
+        self.entra_auth = Some(auth);
+        self
+    }
+
+    /// Supply a custom cross-platform token provider for Azure Virtual Desktop (`gatewaybrokeringtype:i:1`)
+    /// orchestration and session-host PoP authentication.
+    ///
+    /// On Windows, when omitted, IronRDP defaults to Windows Web Account Manager (`WebAuthenticationCoreManager`).
+    #[cfg(all(feature = "gateway", feature = "entra-auth"))]
+    #[must_use]
+    pub fn with_avd_token_provider(mut self, provider: Arc<dyn crate::avd::AvdTokenProvider>) -> Self {
+        self.avd_token_provider = Some(provider);
+        self
+    }
+
     /// Set the TLS peer-certificate validation policy.
     ///
     /// The default preserves historic behavior by accepting invalid certificates. Use
@@ -1574,16 +1682,37 @@ impl ConfigBuilder {
     }
 
     /// Set the kerberos config. Upserts the `kdcproxyurl` property (or clears it when the config
-    /// has no KDC proxy URL); `hostname` is derived from the client name and not stored separately.
+    /// has no KDC proxy URL) and always clears `kdcproxyname`, so the properties cannot select a
+    /// different KDC than the explicit config; `hostname` is derived from the client name and not
+    /// stored separately.
     #[must_use]
     pub fn with_kerberos_config(mut self, cfg: ironrdp_connector::credssp::KerberosConfig) -> Self {
-        if let Some(url) = &cfg.kdc_proxy_url {
+        self.properties.clear_kdc_proxy_name();
+        if let KdcResolution::KdcUrl(Some(url)) = &cfg.kdc_resolution {
             self.properties.set_kdc_proxy_url(url.to_string());
         } else {
             self.properties.clear_kdc_proxy_url();
         }
         self.kerberos_config = Some(cfg);
         self
+    }
+
+    /// Require experimental RCG instead of ordinary password-delegating CredSSP.
+    ///
+    /// Requires the `remote-guard` feature, strict TLS validation, and Kerberos-capable credentials.
+    /// The mode mirrors CredSSP package selection: `Negotiate` redirects both Kerberos and
+    /// NTLMv2, while `Kerberos` and `Ntlm` restrict redirection to one package.
+    #[must_use]
+    pub fn with_remote_guard_mode(mut self, mode: RemoteGuardMode) -> Self {
+        self.properties.set_remote_guard_mode(mode);
+        self.remote_guard_mode = mode;
+        self
+    }
+
+    #[cfg(feature = "__test")]
+    #[doc(hidden)]
+    pub fn __test_remote_guard_mode_and_properties(&self) -> (RemoteGuardMode, &PropertySet) {
+        (self.remote_guard_mode, &self.properties)
     }
 
     /// Set the minimum interval between non-forced input batches.
@@ -1814,6 +1943,48 @@ impl ConfigBuilder {
         self
     }
 
+    /// Enable the Windows 365 virtual desktop control channel with the given launch URI, or disable it with `None`.
+    #[cfg(feature = "w365")]
+    #[must_use]
+    pub fn with_virtual_desktop_switch(mut self, launch_uri: Option<String>) -> Self {
+        self.channels.virtual_desktop_switch = launch_uri;
+        self
+    }
+
+    /// Enable or disable the Windows 365 battery status redirection channel.
+    #[cfg(feature = "w365")]
+    #[must_use]
+    pub fn with_battery_status_redirection(mut self, enabled: bool) -> Self {
+        self.channels.battery_status = enabled;
+        self
+    }
+
+    /// Enable or disable the Windows 365 power request redirection channel.
+    #[cfg(feature = "w365")]
+    #[must_use]
+    pub fn with_power_request_redirection(mut self, enabled: bool) -> Self {
+        self.channels.power_request = enabled;
+        self
+    }
+
+    /// Enable or disable the Windows 365 screen capture redirection channel.
+    #[cfg(feature = "w365")]
+    #[must_use]
+    pub fn with_screen_capture_redirection(mut self, enabled: bool) -> Self {
+        self.channels.screen_capture = enabled;
+        self
+    }
+
+    /// Enable the `Microsoft::Windows::RDS::InteractiveEntraAuth` dynamic virtual channel.
+    ///
+    /// See [`ChannelConfig::interactive_entra_auth`].
+    #[cfg(feature = "entra-auth")]
+    #[must_use]
+    pub fn with_interactive_entra_auth(mut self, enabled: bool) -> Self {
+        self.channels.interactive_entra_auth = enabled;
+        self
+    }
+
     /// Advertise that the client sends relative mouse input.
     ///
     /// Sets `RNS_UD_CS_RELATIVE_MOUSE_INPUT` in the GCC Client Core Data. Enable it before sending
@@ -1968,6 +2139,18 @@ impl ConfigBuilder {
         self
     }
 
+    fn is_avd_gateway(&self) -> bool {
+        #[cfg(all(feature = "gateway", feature = "entra-auth"))]
+        {
+            matches!(self.transport, TransportKind::Gateway { .. })
+                && self.properties.get::<i64>("gatewaybrokeringtype") == Some(1)
+        }
+        #[cfg(not(all(feature = "gateway", feature = "entra-auth")))]
+        {
+            false
+        }
+    }
+
     /// List the required fields that still need a value before [`build`](Self::build) can succeed.
     ///
     /// Gateway credentials are only required when a gateway transport is selected.
@@ -1975,6 +2158,14 @@ impl ConfigBuilder {
     /// because [`build`](Self::build) resolves them from the RDP server account.
     pub fn missing(&self) -> Vec<MissingField> {
         let mut missing = Vec::new();
+        let is_avd_gateway = self.is_avd_gateway();
+        #[cfg(feature = "entra-auth")]
+        let uses_entra_auth = self.entra_auth.is_some()
+            || (is_avd_gateway && self.properties.get::<bool>("enablerdsaadauth").unwrap_or(false));
+        #[cfg(not(feature = "entra-auth"))]
+        let uses_entra_auth = false;
+        #[cfg(not(feature = "gateway"))]
+        let _ = is_avd_gateway;
         #[cfg(all(windows, feature = "vmconnect"))]
         let uses_current_vmconnect_credentials = self.vm_id.is_some() && self.vmconnect_current_user;
         #[cfg(not(all(windows, feature = "vmconnect")))]
@@ -1992,13 +2183,15 @@ impl ConfigBuilder {
         if self.destination.is_none() {
             missing.push(MissingField::ServerAddress);
         }
-        if self.username.is_none()
+        if !uses_entra_auth
+            && self.username.is_none()
             && (!uses_current_vmconnect_credentials
                 || (gateway_uses_server_credentials && self.gateway_username.is_none()))
         {
             missing.push(MissingField::Username);
         }
-        if self.password.is_none()
+        if !uses_entra_auth
+            && self.password.is_none()
             && (!uses_current_vmconnect_credentials
                 || (gateway_uses_server_credentials && self.gateway_password.is_none()))
         {
@@ -2009,6 +2202,7 @@ impl ConfigBuilder {
             self.transport,
             TransportKind::Gateway { .. } | TransportKind::GatewayRpch { .. }
         ) && !gateway_uses_server_credentials
+            && !is_avd_gateway
         {
             if self.gateway_username.is_none() {
                 missing.push(MissingField::GatewayUsername);
@@ -2074,11 +2268,19 @@ impl ConfigBuilder {
             );
         }
 
+        let is_avd_gateway = self.is_avd_gateway();
+        if self.properties.get::<i64>("gatewaybrokeringtype") == Some(1) && !is_avd_gateway {
+            anyhow::bail!(
+                "AVD gateway orchestration (gatewaybrokeringtype:i:1) requires the HTTP/WebSocket gateway transport and the entra-auth feature"
+            );
+        }
+
         #[cfg(feature = "gateway")]
         if matches!(
             self.transport,
             TransportKind::Gateway { .. } | TransportKind::GatewayRpch { .. }
-        ) {
+        ) && !is_avd_gateway
+        {
             use ironrdp_cfg::GatewayCredentialsSource;
 
             match self
@@ -2087,6 +2289,10 @@ impl ConfigBuilder {
                 .context("invalid gateway credential source")?
             {
                 Some(GatewayCredentialsSource::UseServerCredentials) => {
+                    #[cfg(feature = "entra-auth")]
+                    if self.entra_auth.is_some() || self.properties.get::<bool>("enablerdsaadauth").unwrap_or(false) {
+                        anyhow::bail!("gateway UseServerCredentials requires RDP username and password credentials");
+                    }
                     if self.gateway_username.is_none() {
                         self.gateway_username = self.username.as_deref().map(|username| match self.domain.as_deref() {
                             Some(domain)
@@ -2188,6 +2394,19 @@ impl ConfigBuilder {
             self.properties.set_server_port(ironrdp_vmconnect::PORT);
         }
 
+        #[cfg(feature = "entra-auth")]
+        let property_entra_auth = self.properties.get::<bool>("enablerdsaadauth").unwrap_or(false);
+        #[cfg(feature = "entra-auth")]
+        if property_entra_auth && self.entra_auth.is_none() && !is_avd_gateway {
+            anyhow::bail!(
+                "enablerdsaadauth requires an EntraAuthSession (ConfigBuilder::with_entra_auth) or an AVD gateway (gatewaybrokeringtype:i:1)"
+            );
+        }
+        #[cfg(feature = "entra-auth")]
+        let entra_auth_enabled = self.entra_auth.is_some() || property_entra_auth;
+        #[cfg(not(feature = "entra-auth"))]
+        let entra_auth_enabled = false;
+
         if self.certificate_validation == Some(ironrdp_tls::CertificateValidation::DangerouslyAcceptInvalidCertificate)
             && self.certificate_validation_callback.is_some()
         {
@@ -2214,6 +2433,31 @@ impl ConfigBuilder {
         #[cfg(not(windows))]
         let enable_standard_rdp_security = false;
 
+        #[cfg(feature = "entra-auth")]
+        if entra_auth_enabled {
+            anyhow::ensure!(
+                self.enable_tls.unwrap_or(true),
+                "Entra RDS AAD authentication requires TLS"
+            );
+            anyhow::ensure!(
+                self.certificate_validation_callback.is_none(),
+                "Entra RDS AAD authentication does not support certificate-validation overrides"
+            );
+            anyhow::ensure!(
+                !matches!(self.transport, TransportKind::RDCleanPath { .. }),
+                "Entra RDS AAD authentication requires a validated TLS connection to the RDP server and is not supported with RDCleanPath"
+            );
+            anyhow::ensure!(
+                !enable_standard_rdp_security,
+                "Entra RDS AAD authentication is not supported over standard-security transports"
+            );
+            #[cfg(feature = "vmconnect")]
+            anyhow::ensure!(
+                self.vm_id.is_none(),
+                "Entra RDS AAD authentication is not supported with VMConnect"
+            );
+        }
+
         // Resolve the granular transport selection into the bundled form, folding in the separately
         // tracked secrets (gateway credentials, RDCleanPath token).
         #[expect(
@@ -2228,8 +2472,8 @@ impl ConfigBuilder {
                 prefer_direct,
             } => Transport::Gateway(GatewayConfig {
                 endpoint,
-                username: self.gateway_username.unwrap(),
-                password: self.gateway_password.unwrap(),
+                username: self.gateway_username.unwrap_or_default(),
+                password: self.gateway_password.unwrap_or_default(),
                 prefer_direct,
             }),
             #[cfg(feature = "gateway")]
@@ -2261,16 +2505,25 @@ impl ConfigBuilder {
         }
 
         let client_name = self.client_name.unwrap_or_default();
-        let kerberos_config = self
+        let mut kerberos_config = self
             .kerberos_config
             .or_else(|| kerberos_config_from_properties(&self.properties, &client_name));
-        let certificate_validation = self.certificate_validation.unwrap_or_else(|| {
-            if self.certificate_validation_callback.is_some() {
-                ironrdp_tls::CertificateValidation::Strict
-            } else {
-                ironrdp_tls::CertificateValidation::default()
-            }
-        });
+        let certificate_validation = if entra_auth_enabled || is_avd_gateway {
+            anyhow::ensure!(
+                self.certificate_validation
+                    != Some(ironrdp_tls::CertificateValidation::DangerouslyAcceptInvalidCertificate),
+                "Entra RDS AAD and AVD gateway authentication require TLS certificate validation"
+            );
+            ironrdp_tls::CertificateValidation::Strict
+        } else {
+            self.certificate_validation.unwrap_or_else(|| {
+                if self.certificate_validation_callback.is_some() {
+                    ironrdp_tls::CertificateValidation::Strict
+                } else {
+                    ironrdp_tls::CertificateValidation::default()
+                }
+            })
+        };
 
         // Bulk compression is enabled by default. We default to MPPC 64K (RDP5) rather than the
         // richer XCRUSH (RDP6.1) because it is the most universally supported and lowest-state
@@ -2286,16 +2539,52 @@ impl ConfigBuilder {
             None
         };
 
-        let enable_tls = if enable_standard_rdp_security {
+        let enable_tls = if entra_auth_enabled {
+            true
+        } else if enable_standard_rdp_security {
             false
         } else {
             self.enable_tls.unwrap_or(true)
         };
-        let enable_credssp = if enable_standard_rdp_security {
-            false
-        } else {
-            self.enable_credssp.unwrap_or(true)
-        };
+        let enable_credssp =
+            !entra_auth_enabled && !enable_standard_rdp_security && self.enable_credssp.unwrap_or(true);
+
+        if self.remote_guard_mode.is_enabled() {
+            if !cfg!(feature = "remote-guard") {
+                anyhow::bail!("remote credential guard requires the experimental remote-guard build feature");
+            }
+            if !enable_tls || !enable_credssp || enable_standard_rdp_security {
+                anyhow::bail!("remote credential guard requires TLS and CredSSP");
+            }
+            if matches!(transport, Transport::RDCleanPath(_)) {
+                anyhow::bail!(
+                    "remote credential guard requires a validated TLS connection to the RDP server and is not supported with RDCleanPath"
+                );
+            }
+            #[cfg(feature = "vmconnect")]
+            if self.vm_id.is_some() {
+                anyhow::bail!("remote credential guard is not supported for VMConnect");
+            }
+            if certificate_validation != ironrdp_tls::CertificateValidation::Strict {
+                anyhow::bail!("remote credential guard requires strict TLS certificate validation");
+            }
+            if client_name.is_empty() {
+                anyhow::bail!("remote credential guard requires a client computer name");
+            }
+            if let Some(cfg) = &kerberos_config {
+                if matches!(cfg.kdc_resolution, KdcResolution::IAKerb) {
+                    anyhow::bail!("remote credential guard does not support IAKerb");
+                }
+            } else {
+                if self.properties.kdc_proxy_url().is_some() || self.properties.kdc_proxy_name().is_some() {
+                    anyhow::bail!("invalid KDC proxy configuration for remote credential guard");
+                }
+                kerberos_config = Some(ironrdp_connector::credssp::KerberosConfig {
+                    kdc_resolution: KdcResolution::KdcUrl(None),
+                    hostname: client_name.clone(),
+                });
+            }
+        }
 
         let remote_application_mode = self.remote_application_mode.unwrap_or(false);
         let rail_support_level = self
@@ -2370,6 +2659,7 @@ impl ConfigBuilder {
             support_dyn_vc_gfx_protocol: self
                 .graphics_pipeline
                 .unwrap_or_else(|| self.channels.h264_decoder.is_some()),
+            rdp_version: self.rdp_version.unwrap_or(ironrdp_pdu::gcc::RdpVersion::V5_PLUS),
             compression_type,
             performance_flags: self.performance_flags.unwrap_or_default(),
             timezone_info: TimezoneInfo::default(),
@@ -2408,6 +2698,14 @@ impl ConfigBuilder {
             udp_offer_version: self.udp_offer_version.unwrap_or(UdpVersion::V3),
             certificate_validation,
             certificate_validation_callback: self.certificate_validation_callback,
+            #[cfg(feature = "entra-auth")]
+            entra_auth: self.entra_auth,
+            #[cfg(all(feature = "gateway", feature = "entra-auth"))]
+            avd_token_provider: self.avd_token_provider,
+            #[cfg(all(feature = "gateway", feature = "entra-auth"))]
+            avd_gateway_token: self.avd_gateway_token,
+            #[cfg(all(feature = "gateway", feature = "entra-auth"))]
+            avd_sso_logon_token: self.avd_sso_logon_token,
             #[cfg(feature = "vmconnect")]
             vm_id: self.vm_id,
             #[cfg(feature = "vmconnect")]
@@ -2415,6 +2713,7 @@ impl ConfigBuilder {
             #[cfg(all(windows, feature = "vmconnect"))]
             vmconnect_current_user: self.vmconnect_current_user,
             kerberos_config,
+            remote_guard_mode: self.remote_guard_mode,
             input_send_interval: self.input_send_interval,
             input_keepalive_interval: self.input_keepalive_interval,
             fake_events_interval: self.fake_events_interval,
@@ -2446,6 +2745,27 @@ impl ConfigBuilder {
         ConfigBuilder::new().with_property_set(ps)
     }
 
+    /// Applies companion metadata from a sibling `<rdp_file>.json` file (such as Windows App / AVD
+    /// launch files) onto `properties` when not already set in the `.rdp` file.
+    pub fn apply_rdp_launch_companion(rdp_file: &std::path::Path, properties: &mut PropertySet) {
+        #[cfg(any(feature = "cloud", feature = "entra-auth"))]
+        if properties.username().is_none() {
+            let mut added_os = rdp_file.as_os_str().to_os_string();
+            added_os.push(".json");
+            let added_json = PathBuf::from(added_os);
+            if let Ok(json_text) = std::fs::read_to_string(&added_json)
+                .or_else(|_| std::fs::read_to_string(rdp_file.with_extension("json")))
+                && let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_text)
+                && let Some(user) = val.get("UserName").and_then(serde_json::Value::as_str)
+                && !user.is_empty()
+            {
+                properties.set_username(user.to_owned());
+            }
+        }
+        #[cfg(not(any(feature = "cloud", feature = "entra-auth")))]
+        let _ = (rdp_file, properties);
+    }
+
     /// Overlay a `.rdp` [`PropertySet`] on top of the current builder.
     ///
     /// Only properties present in `ps` set values, so this can be layered:
@@ -2458,6 +2778,16 @@ impl ConfigBuilder {
         use ironrdp_cfg::{AudioCaptureMode, AudioMode, TargetHost};
 
         self.properties.merge(ps);
+
+        #[cfg(all(feature = "gateway", feature = "entra-auth"))]
+        {
+            if let Some(token) = ps.get::<&str>("ironrdp_avd_gateway_token") {
+                self.avd_gateway_token = (!token.is_empty()).then(|| zeroize::Zeroizing::new(token.to_owned()));
+            }
+            if let Some(token) = ps.get::<&str>("ironrdp_avd_sso_logon_token") {
+                self.avd_sso_logon_token = (!token.is_empty()).then(|| zeroize::Zeroizing::new(token.to_owned()));
+            }
+        }
 
         let target = ps.full_address().context("invalid 'full address'")?.or(ps
             .alternate_full_address()
@@ -2482,6 +2812,9 @@ impl ConfigBuilder {
         }
         if let Some(enable_credssp) = ps.enable_credssp_support() {
             self.enable_credssp = Some(enable_credssp);
+        }
+        if let Some(mode) = ps.remote_guard_mode()? {
+            self.remote_guard_mode = mode;
         }
         if let Some(enable_tls) = ps.enable_tls() {
             self.enable_tls = Some(enable_tls);
@@ -2917,7 +3250,7 @@ fn kerberos_config_from_properties(
     Url::parse(&kdc_proxy_url)
         .ok()
         .map(|url| ironrdp_connector::credssp::KerberosConfig {
-            kdc_proxy_url: Some(url),
+            kdc_resolution: KdcResolution::KdcUrl(Some(url)),
             hostname: client_name.to_owned(),
         })
 }
